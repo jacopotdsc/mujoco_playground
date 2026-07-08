@@ -72,11 +72,11 @@ def geoms_colliding(state: mjx.Data, geom1: int, geom2: int) -> jax.Array:
 
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
-      ctrl_dt=0.002,
+      ctrl_dt=0.002,#2,
       sim_dt=0.002,
       episode_length=1000,
       Kp=35.0,
-      Kd=10,
+      Kd=10.0,
       action_repeat=1,
       action_scale=1.0,
       history_len=1,
@@ -129,7 +129,7 @@ def default_config() -> config_dict.ConfigDict:
       ),
       command_config=config_dict.create(
           # Uniform distribution for command amplitude.
-          a=[1.5, 0.0, 1.2],
+          a=[0.0, 0.0, 0.0],
           # Probability of not zeroing out new command.
           b=[0.9, 0.25, 0.5],
       ),
@@ -399,8 +399,8 @@ class Joystick(tita_base.TitaEnv):
   
   def _run_mpc_wbc(self, data, qpos: jax.Array, qvel: jax.Array, command: jax.Array, mpc_state, theta_prev, timestep: int):
     """Run the MPC planner (called every mpc_period steps)."""
-    #qpos = jp.nan_to_num(qpos, nan=0.0, posinf=0.0, neginf=0.0)
-    #qvel = jp.nan_to_num(qvel, nan=0.0, posinf=0.0, neginf=0.0)
+    qpos = jp.nan_to_num(qpos, nan=0.0, posinf=0.0, neginf=0.0)
+    qvel = jp.nan_to_num(qvel, nan=0.0, posinf=0.0, neginf=0.0)
 
     contact_ids = sim_utils.geom_ids(self._mj_model, config.contact_frame)
     
@@ -426,6 +426,7 @@ class Joystick(tita_base.TitaEnv):
         dpr_world_wbc,
     )
 
+    tau = jp.nan_to_num(tau[0], nan=0.0, posinf=0.0, neginf=0.0)
     return mpc_state, tau, qddot, fl, fr, desired, theta_prev
 
   def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
@@ -433,7 +434,6 @@ class Joystick(tita_base.TitaEnv):
       state = self._maybe_apply_perturbation(state)
     # state = self._reset_if_outside_bounds(state)
 
-    jax.debug.print("-----\nstep {val}", val=state.info["step_counter"])
     mpc_state, tau, qddot, fl, fr, desired, theta_prev = self._run_mpc_wbc(
         data=state.data, 
         qpos=state.data.qpos, 
@@ -445,11 +445,35 @@ class Joystick(tita_base.TitaEnv):
         )
     state.info["mpc_state"] = mpc_state
     state.info["mpc_tau"] = tau
+    state.info["theta_prev"] = theta_prev
     
-    motor_targets = tau[0] #jnp.zeros_like(self._default_pose)
-    data = mjx_env.step(
-        self.mjx_model, state.data, motor_targets, self.n_substeps
-    )
+    def substep_fn(data, _):
+        tau_p = self._config.Kp * ( self._default_pose + action*self._config.action_scale - data.qpos[7:])
+        tau_d = self._config.Kd * ( - data.qvel[6:])
+        tau_pd = tau_p + tau_d
+
+        motor_targets = tau #+ tau_pd 
+
+        data = data.replace(ctrl=motor_targets)
+        data = mjx.step(self.mjx_model, data)
+        llc_log = {
+            #"tau_ff":      tau_ff,
+            "q_des":       jp.zeros_like(data.qpos[7:]),  # q_des,
+            "dq_des":      jp.zeros_like(data.qvel[6:]),  # dq_des,
+            "qacc_joints": jp.zeros_like(data.qvel[6:]),  # qacc_joints,
+            "tau_p":       tau_p,
+            "tau_d":       tau_d,
+            "kp":          jp.array(self._config.Kp),
+            "kd":          jp.array(self._config.Kd),
+            "action_scale": jp.array(self._config.action_scale),
+            "action":      action,
+            "qpos":        data.qpos,
+        }
+        return data, llc_log
+    jax.debug.print("substep: {val}", val=self.n_substeps)
+    data, llc_logs = jax.lax.scan(substep_fn, state.data, None, length=self.n_substeps)
+    state.info["low_level_controller"] = jax.tree_util.tree_map(lambda x: x[-1], llc_logs)
+    state = state.replace(data=data)
 
     contact = jp.array([
         geoms_colliding(data, geom_id, self._floor_geom_id)
@@ -507,8 +531,10 @@ class Joystick(tita_base.TitaEnv):
   def _get_termination(self, data: mjx.Data) -> jax.Array:
     fall_termination = self.get_upvector(data)[-1] < 0.0
     floating_base_touch_ground = geoms_colliding(data, self._torso_body_id, self._floor_geom_id)
+    nan_qpos = jp.any(jp.isnan(data.qpos))
+    nan_qvel = jp.any(jp.isnan(data.qvel))
     return (
-        fall_termination | floating_base_touch_ground | jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
+        fall_termination | floating_base_touch_ground | nan_qpos | nan_qvel
     )
 
   def _get_obs(
