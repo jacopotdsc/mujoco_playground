@@ -30,6 +30,8 @@ from mujoco_playground._src.locomotion.g1 import joystick as g1_joystick
 from mujoco_playground._src.locomotion.g1 import randomize as g1_randomize
 from mujoco_playground._src.locomotion.aliengo import joystick as aliengo_joystick
 from mujoco_playground._src.locomotion.aliengo import randomize as aliengo_randomize
+from mujoco_playground._src.locomotion.tita import joystick as tita_joystick
+from mujoco_playground._src.locomotion.tita import randomize as tita_randomize
 from mujoco_playground._src.locomotion.go1 import getup as go1_getup
 from mujoco_playground._src.locomotion.go1 import handstand as go1_handstand
 from mujoco_playground._src.locomotion.go1 import joystick as go1_joystick
@@ -63,6 +65,27 @@ _envs = {
     ),
     "AliengoJoystickFlatTerrain": functools.partial(
         aliengo_joystick.Joystick, task="flat_terrain"
+    ),
+    "AliengoJoystickRoughTerrain": functools.partial(
+        aliengo_joystick.Joystick, task="rough_terrain"
+    ),
+    "AliengoJoystickStairsTerrain": functools.partial(
+        aliengo_joystick.Joystick, task="stairs_terrain"
+    ),
+    "AliengoJoystickPerlinTerrain": functools.partial(
+        aliengo_joystick.Joystick, task="perlin_terrain"
+    ),
+    "TitaJoystickFlatTerrain": functools.partial(
+        tita_joystick.Joystick, task="flat_terrain"
+    ),
+    "TitaJoystickRoughTerrain": functools.partial(
+        tita_joystick.Joystick, task="rough_terrain"
+    ),
+    "TitaJoystickStairsTerrain": functools.partial(
+        tita_joystick.Joystick, task="stairs_terrain"
+    ),
+    "TitaJoystickPerlinTerrain": functools.partial(
+        tita_joystick.Joystick, task="perlin_terrain"
     ),
     "Go1JoystickFlatTerrain": functools.partial(
         go1_joystick.Joystick, task="flat_terrain"
@@ -103,6 +126,13 @@ _cfgs = {
     "G1JoystickFlatTerrain": g1_joystick.default_config,
     "G1JoystickRoughTerrain": g1_joystick.default_config,
     "AliengoJoystickFlatTerrain": aliengo_joystick.default_config,
+    "AliengoJoystickRoughTerrain": aliengo_joystick.default_config,
+    "AliengoJoystickStairsTerrain": aliengo_joystick.default_config,
+    "AliengoJoystickPerlinTerrain": aliengo_joystick.default_config,
+    "TitaJoystickFlatTerrain": tita_joystick.default_config,
+    "TitaJoystickRoughTerrain": tita_joystick.default_config,
+    "TitaJoystickStairsTerrain": tita_joystick.default_config,
+    "TitaJoystickPerlinTerrain": tita_joystick.default_config,
     "Go1JoystickFlatTerrain": go1_joystick.default_config,
     "Go1JoystickRoughTerrain": go1_joystick.default_config,
     "Go1Getup": go1_getup.default_config,
@@ -128,6 +158,13 @@ _randomizer = {
     "G1JoystickFlatTerrain": g1_randomize.domain_randomize,
     "G1JoystickRoughTerrain": g1_randomize.domain_randomize,
     "AliengoJoystickFlatTerrain": aliengo_randomize.domain_randomize,
+    "AliengoJoystickRoughTerrain": aliengo_randomize.domain_randomize,
+    "AliengoJoystickStairsTerrain": aliengo_randomize.domain_randomize,
+    "AliengoJoystickPerlinTerrain": aliengo_randomize.domain_randomize,
+    "TitaJoystickFlatTerrain": tita_randomize.domain_randomize,
+    "TitaJoystickRoughTerrain": tita_randomize.domain_randomize,
+    "TitaJoystickStairsTerrain": tita_randomize.domain_randomize,
+    "TitaJoystickPerlinTerrain": tita_randomize.domain_randomize,
     "Go1JoystickFlatTerrain": go1_randomize.domain_randomize,
     "Go1JoystickRoughTerrain": go1_randomize.domain_randomize,
     "Go1Getup": go1_randomize.domain_randomize,

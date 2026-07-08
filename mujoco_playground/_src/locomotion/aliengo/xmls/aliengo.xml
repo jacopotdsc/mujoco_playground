@@ -229,6 +229,10 @@
         <framepos objtype="site" objname="RR" name="RR_pos" reftype="site" refname="imu"/>
         <framepos objtype="site" objname="RL" name="RL_pos" reftype="site" refname="imu"/>
         
+        <touch name="FL_touch" site="FL"/>
+        <touch name="FR_touch" site="FR"/>
+        <touch name="RL_touch" site="RL"/>
+        <touch name="RR_touch" site="RR"/>
     </sensor>
 
 

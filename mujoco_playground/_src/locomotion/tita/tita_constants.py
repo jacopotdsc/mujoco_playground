@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Defines Unitree Aliengo quadruped constants."""
+"""Constants for Tita."""
 
 from etils import epath
 
 from mujoco_playground._src import mjx_env
+import jax.numpy as jp
 
-ROOT_PATH = mjx_env.ROOT_PATH / "locomotion" / "aliengo"
+ROOT_PATH = mjx_env.ROOT_PATH / "locomotion" / "tita"
 FEET_ONLY_FLAT_TERRAIN_XML = (
     ROOT_PATH / "xmls" / "scene_flat.xml"
 )
@@ -38,33 +39,31 @@ FEET_ONLY_PERLIN_TERRAIN_XML = (
 )
 
 
-
 def task_to_xml(task_name: str) -> epath.Path:
   return {
       "flat_terrain": FEET_ONLY_FLAT_TERRAIN_XML,
       "rough_terrain": FEET_ONLY_ROUGH_TERRAIN_XML,
-      "stairs_terrain": FEET_ONLY_STAIRS_TERRAIN_XML,
-      "perlin_terrain": FEET_ONLY_PERLIN_TERRAIN_XML,
   }[task_name]
 
 
 FEET_SITES = [
-    "FL",
-    "FR",
-    "RL",
-    "RR",
+    "left_leg_4_site",
+    "right_leg_4_site",
 ]
 
-FEET_GEOMS = [
-    "FL",
-    "FR",
-    "RL",
-    "RR",
+LEFT_FEET_GEOMS = [
+    "left_leg_4_collision",
 ]
+
+RIGHT_FEET_GEOMS = [
+    "right_leg_4_collision",
+]
+
+FEET_GEOMS = LEFT_FEET_GEOMS + RIGHT_FEET_GEOMS
 
 FEET_POS_SENSOR = [f"{site}_pos" for site in FEET_SITES]
 
-ROOT_BODY = "trunk"
+ROOT_BODY = "base_link"
 
 UPVECTOR_SENSOR = "upvector"
 GLOBAL_LINVEL_SENSOR = "global_linvel"
@@ -72,3 +71,7 @@ GLOBAL_ANGVEL_SENSOR = "global_angvel"
 LOCAL_LINVEL_SENSOR = "local_linvel"
 ACCELEROMETER_SENSOR = "accelerometer"
 GYRO_SENSOR = "gyro"
+
+TITA_NUM_FEET = 2
+TITA_WHEEL_INDICES = jp.array([3, 7])
+TITA_LEG_INDICES = jp.array([0, 1, 2, 4, 5, 6])
