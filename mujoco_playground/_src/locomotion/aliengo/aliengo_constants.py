@@ -72,3 +72,5 @@ GLOBAL_ANGVEL_SENSOR = "global_angvel"
 LOCAL_LINVEL_SENSOR = "local_linvel"
 ACCELEROMETER_SENSOR = "accelerometer"
 GYRO_SENSOR = "gyro"
+
+TERMINATION_GEOMS = ("trunk_collision",)

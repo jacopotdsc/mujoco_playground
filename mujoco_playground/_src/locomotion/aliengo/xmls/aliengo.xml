@@ -50,6 +50,7 @@
             <!-- trunk visual mesh and collision -->
             <geom type="mesh" class="visual" rgba="0.2 0.2 0.2 1" mesh="trunk"/>
             <geom type="box" class="collision" size="0.18 0.075 0.056" contype="0" conaffinity="0"/>
+            <geom name="trunk_collision" type="box" class="collision" size="0.18 0.075 0.056" contype="1" conaffinity="1"/>
 
             <!-- modify this to add payload -->
             <!--body name="payload" pos="0 0 0">

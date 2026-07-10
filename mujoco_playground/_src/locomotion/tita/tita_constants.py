@@ -75,3 +75,21 @@ GYRO_SENSOR = "gyro"
 TITA_NUM_FEET = 2
 TITA_WHEEL_INDICES = jp.array([3, 7])
 TITA_LEG_INDICES = jp.array([0, 1, 2, 4, 5, 6])
+
+NUM_DOFS = 8
+LEG_DOF_IDS = (0, 1, 2, 4, 5, 6)   # position-controlled
+WHEEL_DOF_IDS = (3, 7)  
+
+EET_SITES = ("left_leg_4_site", "right_leg_4_site")
+FEET_GEOMS = ("left_leg_4_collision", "right_leg_4_collision")
+FEET_TOUCH_SENSORS = ("FL_floor_found", "FR_floor_found")
+FEET_FLOOR_FOUND_SENSORS = ("FL_floor_found", "FR_floor_found")
+
+FLOOR_GEOM = "floor"
+ 
+# Geoms che, a contatto con il pavimento, terminano l'episodio
+# (equivalente di termination_contact_indices in Isaac: "base").
+TERMINATION_GEOMS = ("base_link_collision",)
+ 
+# Geoms penalizzati da _reward_collision (penalised_contact_indices).
+COLLISION_GEOMS = ("left_leg_3_collision", "right_leg_3_collision")

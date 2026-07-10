@@ -14,33 +14,49 @@
 # ==============================================================================
 """Joystick task for Aliengo."""
 
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, Tuple
 
 import jax
 import jax.numpy as jp
 from ml_collections import config_dict
-import mujoco
 from mujoco import mjx
 from mujoco.mjx._src import math
 import numpy as np
+import mujoco
 
 from mujoco_playground._src import mjx_env
 from mujoco_playground._src.locomotion.aliengo import base as aliengo_base
 from mujoco_playground._src.locomotion.aliengo import aliengo_constants as consts
 
-import mpx.config.config_srbd as config
-from mpx.utils.mpc_wrapper_srbd import BatchedMPCControllerWrapper
-import mpx.utils.sim as sim_utils
+#import mpx.config.config_srbd as config
+#from mpx.utils.mpc_wrapper_srbd import BatchedMPCControllerWrapper
+
+def get_collision_info(
+    contact: Any, geom1: int, geom2: int
+) -> Tuple[jax.Array, jax.Array]:
+  """Get the distance and normal of the collision between two geoms."""
+  mask = (jp.array([geom1, geom2]) == contact.geom).all(axis=1)
+  mask |= (jp.array([geom2, geom1]) == contact.geom).all(axis=1)
+  idx = jp.where(mask, contact.dist, 1e4).argmin()
+  dist = contact.dist[idx] * mask[idx]
+  normal = (dist < 0) * contact.frame[idx, 0, :3]
+  return dist, normal
+
+
+def geoms_colliding(state: mjx.Data, geom1: int, geom2: int) -> jax.Array:
+  """Return True if the two geoms are colliding."""
+  return get_collision_info(state._impl.contact, geom1, geom2)[0] < 0  # pylint: disable=protected-access
+
 
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
       ctrl_dt=0.02,
       sim_dt=0.004,
       episode_length=1000,
-      Kp=60.0,
+      Kp=70.0,
       Kd=0.5,
       action_repeat=1,
-      action_scale=0.25,
+      action_scale=0.5,
       history_len=1,
       soft_joint_pos_limit_factor=0.95,
       noise_config=config_dict.create(
@@ -89,7 +105,8 @@ def default_config() -> config_dict.ConfigDict:
       ),
       command_config=config_dict.create(
           # Uniform distribution for command amplitude.
-          a=[1.5, 0.0, 1.2],
+          a=[1.5, 0.8, 1.2],
+          #a=[0.0, 0.0, 0.0],  # Set to 0.0 to disable command.
           # Probability of not zeroing out new command.
           b=[0.9, 0.25, 0.5],
       ),
@@ -137,7 +154,9 @@ class Joystick(aliengo_base.AliengoEnv):
     self._feet_geom_id = np.array(
         [self._mj_model.geom(name).id for name in consts.FEET_GEOMS]
     )
-
+    self._termination_geom_id = np.array(
+        [self._mj_model.geom(name).id for name in consts.TERMINATION_GEOMS]
+    )
     foot_linvel_sensor_adr = []
     for site in consts.FEET_SITES:
       sensor_id = self._mj_model.sensor(f"{site}_global_linvel").id
@@ -151,30 +170,93 @@ class Joystick(aliengo_base.AliengoEnv):
     self._cmd_a = jp.array(self._config.command_config.a)
     self._cmd_b = jp.array(self._config.command_config.b)
 
-    sim_frequency = 1.0 / self.sim_dt
-    self.mpc_period = max(1, int(sim_frequency / config.mpc_frequency))
-    self.mpc = BatchedMPCControllerWrapper(config, 1)
+    #sim_frequency = 1.0 / self.sim_dt
+    #self.mpc_period = max(1, int(sim_frequency / config.mpc_frequency))
+    #self.mpc = BatchedMPCControllerWrapper(config, 1)
 
-    for i in range(self._mj_model.ngeom):
-        name = mujoco.mj_id2name(self._mj_model, mujoco.mjtObj.mjOBJ_GEOM, i)
-        # Salta le geom del robot (piedi, trunk, visual, ecc.)
-        if name in (consts.FEET_GEOMS) or name is None:
-            pass  # i piedi hanno già conaffinity=1
-        
-        # Floor e box terreno: devono avere contype=1
-        if name == "floor" or name is None:
-            # Le geom senza nome sono i box del terreno
-            geom_type = self._mj_model.geom_type[i]
-            if geom_type == mujoco.mjtGeom.mjGEOM_PLANE or geom_type == mujoco.mjtGeom.mjGEOM_BOX:
-                self._mj_model.geom_contype[i] = 1
-                self._mj_model.geom_conaffinity[i] = 0
-                self._mj_model.geom_condim[i] = 3
+    # --- print initial robot state ---
+    _d = mujoco.MjData(self._mj_model)
+    _d.qpos[:] = np.array(self._init_q)
+    mujoco.mj_forward(self._mj_model, _d)
+    _sep = "=" * 55
+    print(_sep)
+    print("Aliengo – initial robot state")
+    print(_sep)
+    print(f"  p0    (xyz)    : {_d.qpos[0:3]}")
+    print(f"  quat0 (w,x,y,z): {_d.qpos[3:7]}")
+    print(f"  q0    (joints) : {_d.qpos[7:]}")
+    print(f"  Total mass     : {self._torso_mass:.4f} kg")
+    # full 3x3 inertia in body frame: I = R @ diag(principal) @ R.T
+    # body_iquat is (w,x,y,z) – rotation from principal frame to body frame
+    _iq = self._mj_model.body_iquat[self._torso_body_id]  # (w,x,y,z)
+    _w, _x, _y, _z = _iq
+    _R = np.array([
+        [1-2*(_y*_y+_z*_z),  2*(_x*_y-_z*_w),  2*(_x*_z+_y*_w)],
+        [  2*(_x*_y+_z*_w),1-2*(_x*_x+_z*_z),  2*(_y*_z-_x*_w)],
+        [  2*(_x*_z-_y*_w),  2*(_y*_z+_x*_w),1-2*(_x*_x+_y*_y)],
+    ])
+    _Idiag = np.diag(self._mj_model.body_inertia[self._torso_body_id])
+    _I3 = _R @ _Idiag @ _R.T
+    print("  Torso inertia (3x3 body frame) [kg·m²]:")
+    for _row in _I3:
+      print(f"    [{_row[0]:+.6f}  {_row[1]:+.6f}  {_row[2]:+.6f}]")
+    _com = _d.subtree_com[self._torso_body_id]
+    print(f"  COM pos (world): [{_com[0]:+.4f}, {_com[1]:+.4f}, {_com[2]:+.4f}]")
+    print(f"  COM height     : {_com[2]:.4f} m")
 
-    # Rebuild mjx_model so contact array shapes match the modified mj_model.
-    # base.__init__ called mjx.put_model before this _post_init ran, so the
-    # compiled mjx_model had stale condim/contype/conaffinity values which
-    # caused shape mismatches in mjx contact solvers.
-    self._mjx_model = mjx.put_model(self._mj_model, impl=self._config.impl)
+    M = np.zeros((self._mj_model.nv, self._mj_model.nv))
+    mujoco.mj_fullM(self._mj_model, M, _d.qM)
+
+    print(M.shape)
+    print(M[3:6, 3:6])
+
+    print(f"  Floating base  : free joint → qpos[0:3]=xyz, qpos[3:7]=quat(wxyz)")
+    print("  Foot positions (world frame):")
+    for _name, _idx in zip(consts.FEET_SITES, self._feet_site_id):
+      _p = _d.site_xpos[_idx]
+      print(f"    {_name:<25s}: [{_p[0]:+.4f}, {_p[1]:+.4f}, {_p[2]:+.4f}]")
+    print(_sep)
+  
+  '''
+  def _build_mpc_input(self, command: jax.Array) -> jax.Array:
+    command = jp.nan_to_num(command, nan=0.0, posinf=0.0, neginf=0.0)
+    return jp.array([
+        command[0],
+        command[1],
+        0.0,
+        0.0,
+        0.0,
+        command[2],
+        config.robot_height,
+    ])
+  
+  def _run_mpc(self, qpos: jax.Array, qvel: jax.Array, geom_xpos: jax.Array,
+               command: jax.Array, mpc_state):
+    """Run the MPC planner (called every mpc_period steps)."""
+    qpos = jp.nan_to_num(qpos, nan=0.0, posinf=0.0, neginf=0.0)
+    qvel = jp.nan_to_num(qvel, nan=0.0, posinf=0.0, neginf=0.0)
+ 
+    foot_world = jp.stack([geom_xpos[gid] for gid in self._feet_geom_id], axis=0)
+    foot_pos = foot_world.reshape(1, -1)
+    foot_pos = jp.nan_to_num(foot_pos, nan=0.0, posinf=0.0, neginf=0.0)
+ 
+    x0 = jp.concatenate([qpos[:3], qpos[3:7], qvel[:3], qvel[3:6]])[None]
+    mpc_input = self._build_mpc_input(command)[None, :]
+ 
+    contact = (foot_world[:, 2] < 0.035).astype(jp.float32)[None, :]
+ 
+    mpc_state = self.mpc.run(mpc_state, x0, mpc_input, foot_pos, contact)
+    return mpc_state
+
+
+  def _whole_body_ctrl(self, qpos: jax.Array, qvel: jax.Array, mpc_state):
+    """Run whole-body controller (called every sim step)."""
+    qpos = jp.nan_to_num(qpos, nan=0.0, posinf=0.0, neginf=0.0)
+    qvel = jp.nan_to_num(qvel, nan=0.0, posinf=0.0, neginf=0.0)
+    tau, _ = self.mpc.whole_body_run(mpc_state, qpos[None], qvel[None])
+    tau = jp.nan_to_num(tau[0], nan=0.0, posinf=0.0, neginf=0.0)
+    return tau
+  '''
 
   def reset(self, rng: jax.Array) -> mjx_env.State:
     qpos = self._init_q
@@ -183,18 +265,18 @@ class Joystick(aliengo_base.AliengoEnv):
     # x=+U(-0.5, 0.5), y=+U(-0.5, 0.5), yaw=U(-3.14, 3.14).
     rng, key = jax.random.split(rng)
     dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
-    #qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
+    qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
     rng, key = jax.random.split(rng)
     yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
     quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
     new_quat = math.quat_mul(qpos[3:7], quat)
-    #qpos = qpos.at[3:7].set(new_quat)
+    qpos = qpos.at[3:7].set(new_quat)
 
     # d(xyzrpy)=U(-0.5, 0.5)
     rng, key = jax.random.split(rng)
-    #qvel = qvel.at[0:6].set(
-    #    jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5)
-    #)
+    qvel = qvel.at[0:6].set(
+        jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5)
+    )
 
     data = mjx_env.make_data(
         self.mj_model,
@@ -239,18 +321,17 @@ class Joystick(aliengo_base.AliengoEnv):
         key2, shape=(3,), minval=-self._cmd_a, maxval=self._cmd_a
     )
 
-    mpc_state  = self.mpc.init_state()
-    mpc_state = self._run_mpc(
-        data, data.qpos, data.qvel, data.geom_xpos, cmd, mpc_state
-    )
-    tau = self._whole_body_ctrl(data.qpos, data.qvel, mpc_state)
-    #mpc_obs = self._extract_mpc_obs(mpc_state)
+    #mpc_state  = self.mpc.init_state()
+    #mpc_state = self._run_mpc(
+    #    data.qpos, data.qvel, data.geom_xpos, cmd, mpc_state
+    #)
+    #tau = self._whole_body_ctrl(data.qpos, data.qvel, mpc_state)
+
 
     info = {
         "rng": rng,
         "command": cmd,
         "steps_until_next_cmd": steps_until_next_cmd,
-        "target_command": cmd,
         "last_act": jp.zeros(self.mjx_model.nu),
         "last_last_act": jp.zeros(self.mjx_model.nu),
         "feet_air_time": jp.zeros(4),
@@ -263,22 +344,8 @@ class Joystick(aliengo_base.AliengoEnv):
         "pert_steps": 0,
         "pert_dir": jp.zeros(3),
         "pert_mag": pert_mag,
-        "mpc_state": mpc_state,
-        #"mpc_obs": mpc_obs,
-        "mpc_tau": tau,
-        "low_level_controller": {
-            #"tau_ff":      jp.zeros(self.mjx_model.nu),
-            "q_des":       jp.zeros(self.mjx_model.nu),
-            "dq_des":      jp.zeros(self.mjx_model.nu),
-            "qacc_joints": jp.zeros(self.mjx_model.nu),
-            "tau_p":       jp.zeros(self.mjx_model.nu),
-            "tau_d":       jp.zeros(self.mjx_model.nu),
-            "kp":          jp.zeros(()),
-            "kd":          jp.zeros(()),
-            "action_scale": jp.zeros(()),
-            "action":      jp.zeros(self.mjx_model.nu),
-            "qpos":        jp.zeros(self.mjx_model.nq),
-        },
+        #"mpc_state": mpc_state,
+        #"mpc_tau": tau,
     }
 
     metrics = {}
@@ -298,126 +365,44 @@ class Joystick(aliengo_base.AliengoEnv):
   #   state = state.replace(data=state.data.replace(qpos=qpos))
   #   return state
 
-  def _build_mpc_input(self, command: jax.Array) -> jax.Array:
-    command = jp.nan_to_num(command, nan=0.0, posinf=0.0, neginf=0.0)
-    return jp.array([
-        command[0],
-        command[1],
-        0.0,
-        0.0,
-        0.0,
-        command[2],
-        config.robot_height,
-    ])
-  
-  def _run_mpc(self, data, qpos: jax.Array, qvel: jax.Array, geom_xpos: jax.Array,
-               command: jax.Array, mpc_state):
-    """Run the MPC planner (called every mpc_period steps)."""
-    qpos = jp.nan_to_num(qpos, nan=0.0, posinf=0.0, neginf=0.0)
-    qvel = jp.nan_to_num(qvel, nan=0.0, posinf=0.0, neginf=0.0)
- 
-    foot_world = jp.stack([geom_xpos[gid] for gid in self._feet_geom_id], axis=0)
-    foot_pos = foot_world.reshape(1, -1)
-    foot_pos = jp.nan_to_num(foot_pos, nan=0.0, posinf=0.0, neginf=0.0)
- 
-    x0 = jp.concatenate([qpos[:3], qpos[3:7], qvel[:3], qvel[3:6]])[None]
-    mpc_input = self._build_mpc_input(command)[None, :]
-    contact = jp.array([
-        data.sensordata[self._mj_model.sensor_adr[sid]] > 0
-        for sid in self._feet_floor_found_sensor
-    ]).astype(jp.float32)[None, :]
-            
-    mpc_state = self.mpc.run(mpc_state, x0, mpc_input, foot_pos, contact)
-    return mpc_state
-
-  def _extract_mpc_obs(self, mpc_state) -> jax.Array:
-    """Extract a fixed-size 1D observation vector from the MPC state.
-    grf[0]: (12,)  — ground reaction forces (3 per foot × 4 feet)
-    foot_ref[0]: (12,) — foot reference positions
-    contact[0]: (4,)  — contact schedule
-    Total: 28
-    """
-    return jp.concatenate([
-        mpc_state.grf[0],         # 12
-        mpc_state.foot_ref[0],    # 12
-        mpc_state.contact[0],     # 4
-    ])
-
-  def _whole_body_ctrl(self, qpos: jax.Array, qvel: jax.Array, mpc_state):
-    """Run whole-body controller (called every sim step)."""
-    qpos = jp.nan_to_num(qpos, nan=0.0, posinf=0.0, neginf=0.0)
-    qvel = jp.nan_to_num(qvel, nan=0.0, posinf=0.0, neginf=0.0)
-    tau, J = self.mpc.whole_body_run(mpc_state, qpos[None], qvel[None])
-    tau = jp.nan_to_num(tau[0], nan=0.0, posinf=0.0, neginf=0.0)
-    return tau, J
-
-  def tau_to_qdes(self, data, tau, grf, J, dt):
-    bias = data.qfrc_bias
-    J_j = J[0, 6:, :]
-    vec = jp.zeros(self.mjx_model.nv)
-    vec = vec.at[6:].set(tau - bias[6:] + J_j @ grf)
-    M = mjx.full_m(self.mjx_model, data)
-    qacc = jp.linalg.solve(M, vec)
-    qacc_joints = qacc[6:]
-    qvel_joints = data.qvel[6:]
-    qpos_joints = data.qpos[7:]
-    dq_des = qvel_joints + qacc_joints * dt
-    q_des = qpos_joints + qvel_joints * dt + qacc_joints * (dt ** 2) / 2
-    return q_des, dq_des, qacc_joints
-
   def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
     if self._config.pert_config.enable:
       state = self._maybe_apply_perturbation(state)
     # state = self._reset_if_outside_bounds(state)
 
-    mpc_state = self._run_mpc(
-        state.data, state.data.qpos, state.data.qvel, state.data.geom_xpos,
-        state.info["command"], state.info["mpc_state"],
-    )
-    state.info["mpc_state"] = mpc_state
+    #motor_targets = self._default_pose + action * self._config.action_scale
+    #target_pos = self._default_pose + action * self._config.action_scale
+    #motor_targets = 60*(target_pos - state.data.qpos[7:]) + 1.0 * ( -state.data.qvel[6:])
+    #data = mjx_env.step(
+    #    self.mjx_model, state.data, motor_targets, self.n_substeps
+    #)
+
+    #mpc_state = self._run_mpc(
+    #    state.data.qpos, state.data.qvel, state.data.geom_xpos,
+    #    state.info["command"], state.info["mpc_state"],
+    #)
+    #state.info["mpc_state"] = mpc_state
 
     def substep_fn(data, _):
-        tau_ff, J = self._whole_body_ctrl(data.qpos, data.qvel, mpc_state)
-        #grf = mpc_state.grf[0]
+        #tau_ff = self._whole_body_ctrl(data.qpos, data.qvel, mpc_state)
 
-        #q_des, dq_des, qacc_joints = self.tau_to_qdes(data, tau_ff, grf, J, self.sim_dt)
-        #jax.debug.print("q_des has nan: {}", jp.any(jp.isnan(q_des)))
-        #q_des  = jax.lax.stop_gradient(q_des)
-        #dq_des = jax.lax.stop_gradient(dq_des)
-        #qacc_joints = jax.lax.stop_gradient(qacc_joints)
+        target_pos = self._default_pose + action * self._config.action_scale
+        tau_pd = 70.0 * ( target_pos - data.qpos[7:]) + 1.0 * (-data.qvel[6:])
         
-        #jax.debug.print("nn action: {action}", action=action)
-        tau_p = self._config.Kp * ( self._default_pose + action*self._config.action_scale - data.qpos[7:])
-        tau_d = self._config.Kd * ( - data.qvel[6:])
-        tau_pd = tau_p + tau_d
-        #tau_pd = self._config.Kp * ( q_des - data.qpos[7:]) + self._config.Kd * (dq_des - data.qvel[6:])
-        
-        motor_targets = tau_ff + tau_pd 
+        motor_targets = tau_pd #tau_ff + tau_pd
 
         data = data.replace(ctrl=motor_targets)
         data = mjx.step(self.mjx_model, data)
-        llc_log = {
-            #"tau_ff":      tau_ff,
-            "q_des":       jp.zeros_like(data.qpos[7:]),  # q_des,
-            "dq_des":      jp.zeros_like(data.qvel[6:]),  # dq_des,
-            "qacc_joints": jp.zeros_like(data.qvel[6:]),  # qacc_joints,
-            "tau_p":       tau_p,
-            "tau_d":       tau_d,
-            "kp":          jp.array(self._config.Kp),
-            "kd":          jp.array(self._config.Kd),
-            "action_scale": jp.array(self._config.action_scale),
-            "action":      action,
-            "qpos":        data.qpos,
-        }
-        return data, llc_log
+        return data, None
 
-    data, llc_logs = jax.lax.scan(substep_fn, state.data, None, length=self.n_substeps)
-    state.info["low_level_controller"] = jax.tree_util.tree_map(lambda x: x[-1], llc_logs)
-    state = state.replace(data=data)
+    #data, _ = jax.lax.scan(substep_fn, state.data, None, length=self.n_substeps)
+    #state = state.replace(data=data)
 
-    #jax.debug.print("[step]   qpos nan={n}", n=jp.any(jp.isnan(data.qpos)))
-    #jax.debug.print("[step]   qvel nan={n}", n=jp.any(jp.isnan(data.qvel)))
-
+    motor_targets = self._default_pose + action * self._config.action_scale
+    data = mjx_env.step(
+        self.mjx_model, state.data, motor_targets, self.n_substeps
+    )
+    
     contact = jp.array([
         data.sensordata[self._mj_model.sensor_adr[sensorid]] > 0
         for sensorid in self._feet_floor_found_sensor
@@ -444,15 +429,10 @@ class Joystick(aliengo_base.AliengoEnv):
     state.info["last_act"] = action
     state.info["steps_until_next_cmd"] -= 1
     state.info["rng"], key1, key2 = jax.random.split(state.info["rng"], 3)
-    state.info["target_command"] = jp.where(
+    state.info["command"] = jp.where(
         state.info["steps_until_next_cmd"] <= 0,
-        self.sample_command(key1, state.info["target_command"]),
-        state.info["target_command"],
-    )
-    # Exponential smoothing: tau ~ 0.4s at ctrl_dt=0.02s
-    state.info["command"] = (
-        state.info["command"]
-        + 0.05 * (state.info["target_command"] - state.info["command"])
+        self.sample_command(key1, state.info["command"]),
+        state.info["command"],
     )
     state.info["steps_until_next_cmd"] = jp.where(
         done | (state.info["steps_until_next_cmd"] <= 0),
@@ -472,9 +452,11 @@ class Joystick(aliengo_base.AliengoEnv):
 
   def _get_termination(self, data: mjx.Data) -> jax.Array:
     fall_termination = self.get_upvector(data)[-1] < 0.0
-    nan_qpos = jp.any(jp.isnan(data.qpos))
-    nan_qvel = jp.any(jp.isnan(data.qvel))
-    return fall_termination | nan_qpos | nan_qvel
+    base_contact = jp.array([
+        geoms_colliding(data, gid, self._floor_geom_id)
+        for gid in self._termination_geom_id
+    ]).any()
+    return fall_termination | base_contact
 
   def _get_obs(
       self, data: mjx.Data, info: dict[str, Any]
@@ -523,8 +505,6 @@ class Joystick(aliengo_base.AliengoEnv):
         * self._config.noise_config.level
         * self._config.noise_config.scales.linvel
     )
-
-    #mpc_obs = info["mpc_obs"]  # 28: grf(12) + foot_ref(12) + contact(4)
 
     state = jp.hstack([
         noisy_linvel,  # 3
@@ -583,23 +563,23 @@ class Joystick(aliengo_base.AliengoEnv):
         "lin_vel_z": self._cost_lin_vel_z(self.get_global_linvel(data)),
         "ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
         "orientation": self._cost_orientation(self.get_upvector(data)),
-        #"stand_still": self._cost_stand_still(info["command"], data.qpos[7:]),
+        "stand_still": self._cost_stand_still(info["command"], data.qpos[7:]),
         "termination": self._cost_termination(done),
-        #"pose": self._reward_pose(data.qpos[7:]),
+        "pose": self._reward_pose(data.qpos[7:]),
         "torques": self._cost_torques(data.actuator_force),
         "action_rate": self._cost_action_rate(
             action, info["last_act"], info["last_last_act"]
         ),
-        #"energy": self._cost_energy(data.qvel[6:], data.actuator_force),
-        #"feet_slip": self._cost_feet_slip(data, contact, info),
-        #"feet_clearance": self._cost_feet_clearance(data),
-        #"feet_height": self._cost_feet_height(
-        #    info["swing_peak"], first_contact, info
-        #),
-        #"feet_air_time": self._reward_feet_air_time(
-        #    info["feet_air_time"], first_contact, info["command"]
-        #),
-        #"dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
+        "energy": self._cost_energy(data.qvel[6:], data.actuator_force),
+        "feet_slip": self._cost_feet_slip(data, contact, info),
+        "feet_clearance": self._cost_feet_clearance(data),
+        "feet_height": self._cost_feet_height(
+            info["swing_peak"], first_contact, info
+        ),
+        "feet_air_time": self._reward_feet_air_time(
+            info["feet_air_time"], first_contact, info["command"]
+        ),
+        "dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
     }
 
   # Tracking rewards.
@@ -785,4 +765,3 @@ class Joystick(aliengo_base.AliengoEnv):
     w_k = jax.random.bernoulli(w_rng, 0.5, shape=(3,))
     x_kp1 = x_k - w_k * (x_k - y_k * z_k)
     return x_kp1
-

@@ -72,7 +72,7 @@ def geoms_colliding(state: mjx.Data, geom1: int, geom2: int) -> jax.Array:
 
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
-      ctrl_dt=0.002,#2,
+      ctrl_dt=0.01,#2,
       sim_dt=0.002,
       episode_length=1000,
       Kp=35.0,
@@ -129,7 +129,7 @@ def default_config() -> config_dict.ConfigDict:
       ),
       command_config=config_dict.create(
           # Uniform distribution for command amplitude.
-          a=[0.0, 0.0, 0.0],
+          a=[2.0, 0.0, 0.5],
           # Probability of not zeroing out new command.
           b=[0.9, 0.25, 0.5],
       ),
@@ -339,8 +339,9 @@ class Joystick(tita_base.TitaEnv):
         key2, shape=(3,), minval=-self._cmd_a, maxval=self._cmd_a
     )
 
+
     mpc_state = self.mpc.init_state()
-    mpc_state, tau, qddot, fl, fr, desired, theta_prev = self._run_mpc_wbc(
+    mpc_state, tita_state, dfcip_state, tau, qddot, fl, fr, desired, theta_prev = self._run_mpc_wbc(
         data=data, 
         qpos=data.qpos, 
         qvel=data.qvel, 
@@ -371,8 +372,8 @@ class Joystick(tita_base.TitaEnv):
         "pert_mag": pert_mag,
         "step_counter": 0,
         "mpc_state": mpc_state,
-        #"mpc_obs": mpc_obs,
         "mpc_tau": tau,
+        "dfcip_state": dfcip_state,
         "low_level_controller": {
             #"tau_ff":      jp.zeros(self.mjx_model.nu),
             "q_des":       jp.zeros(self.mjx_model.nu),
@@ -386,6 +387,7 @@ class Joystick(tita_base.TitaEnv):
             "action":      jp.zeros(self.mjx_model.nu),
             "qpos":        jp.zeros(self.mjx_model.nq),
         },
+        "use_only_mpc": False,
     }
 
     metrics = {}
@@ -427,14 +429,14 @@ class Joystick(tita_base.TitaEnv):
     )
 
     tau = jp.nan_to_num(tau[0], nan=0.0, posinf=0.0, neginf=0.0)
-    return mpc_state, tau, qddot, fl, fr, desired, theta_prev
+    return mpc_state, tita_state, x0, tau, qddot, fl, fr, desired, theta_prev
 
   def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
     if self._config.pert_config.enable:
       state = self._maybe_apply_perturbation(state)
     # state = self._reset_if_outside_bounds(state)
 
-    mpc_state, tau, qddot, fl, fr, desired, theta_prev = self._run_mpc_wbc(
+    mpc_state, tita_state, dfcip_state, tau, qddot, fl, fr, desired, theta_prev = self._run_mpc_wbc(
         data=state.data, 
         qpos=state.data.qpos, 
         qvel=state.data.qvel, 
@@ -446,13 +448,15 @@ class Joystick(tita_base.TitaEnv):
     state.info["mpc_state"] = mpc_state
     state.info["mpc_tau"] = tau
     state.info["theta_prev"] = theta_prev
+    state.info["dfcip_state"] = dfcip_state
     
     def substep_fn(data, _):
         tau_p = self._config.Kp * ( self._default_pose + action*self._config.action_scale - data.qpos[7:])
         tau_d = self._config.Kd * ( - data.qvel[6:])
-        tau_pd = tau_p + tau_d
+        tau_network = tau_p.at[jnp.array([3, 7])].set(0.0) + tau_d
+        tau_network = tau_network*(1 - state.info["use_only_mpc"].astype(tau.dtype))
 
-        motor_targets = tau #+ tau_pd 
+        motor_targets = tau + tau_network
 
         data = data.replace(ctrl=motor_targets)
         data = mjx.step(self.mjx_model, data)
@@ -470,7 +474,7 @@ class Joystick(tita_base.TitaEnv):
             "qpos":        data.qpos,
         }
         return data, llc_log
-    jax.debug.print("substep: {val}", val=self.n_substeps)
+    
     data, llc_logs = jax.lax.scan(substep_fn, state.data, None, length=self.n_substeps)
     state.info["low_level_controller"] = jax.tree_util.tree_map(lambda x: x[-1], llc_logs)
     state = state.replace(data=data)
@@ -585,6 +589,13 @@ class Joystick(tita_base.TitaEnv):
         * self._config.noise_config.scales.linvel
     )
 
+    dfcip_state = info["dfcip_state"]
+    noisy_dfcip_state = (
+        dfcip_state
+        + (2 * jax.random.uniform(noise_rng, shape=dfcip_state.shape) - 1)
+        * self._config.noise_config.level
+    )
+
     state = jp.hstack([
         noisy_linvel,  # 3
         noisy_gyro,  # 3
@@ -593,6 +604,7 @@ class Joystick(tita_base.TitaEnv):
         noisy_joint_vel,  # 12
         info["last_act"],  # 12
         info["command"],  # 3
+        noisy_dfcip_state,  # 18
     ])
 
     accelerometer = self.get_accelerometer(data)
@@ -614,6 +626,7 @@ class Joystick(tita_base.TitaEnv):
         #info["feet_air_time"],  # 4
         data.xfrc_applied[self._torso_body_id, :3],  # 3
         info["steps_since_last_pert"] >= info["steps_until_next_pert"],  # 1
+        dfcip_state,  # 18
     ])
 
     return {
