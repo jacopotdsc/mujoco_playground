@@ -1,5 +1,8 @@
 <mujoco model="tita">
-  <option gravity="0 0 -9.81" integrator="RK4" timestep="0.002"/>
+  <option gravity="0 0 -9.81" iterations="10" ls_iterations="5"  integrator="Euler" timestep="0.002"/>
+  <!--
+  <option gravity="0 0 -9.81" iterations="10" ls_iterations="5"  integrator="Euler" timestep="0.002"/>
+  -->
   <default>
     <default class="robot">
       

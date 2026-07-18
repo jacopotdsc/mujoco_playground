@@ -78,7 +78,7 @@ def default_config() -> config_dict.ConfigDict:
       Kp=35.0,
       Kd=10.0,
       action_repeat=1,
-      action_scale=1.0,
+      action_scale=0.1,
       history_len=1,
       soft_joint_pos_limit_factor=0.95,
       noise_config=config_dict.create(
@@ -93,24 +93,20 @@ def default_config() -> config_dict.ConfigDict:
       ),
       reward_config=config_dict.create(
           scales=config_dict.create(
-              # tracking
-              tracking_lin_vel=1.0, 
-              tracking_ang_vel=1.0, 
-              # base
+              tracking_lin_vel=10.0, 
+              tracking_ang_vel=5.0, 
+              action_rate_first_order=-0.001,
+              action_rate_second_order=-0.0001,
+              torques=-0.0001,
+              orientation=1.0,
+              base_height=1.0,
+              joint_regularization=1.0,
+              termination=-100.0,
+
               lin_vel_z=0.0,
               ang_vel_xy=0.0,
-              orientation=1.0,
-              base_height=0.5,
-              # Other.
-              dof_pos_limits=-0.1,
-              pose=0.0,
-              # Other.
-              termination=-1.0,
-              stand_still=-0.0,
-              # Regularization.
-              torques=-0.00005,
-              action_rate=-0.001, 
-              energy=-0.0001,
+              dof_pos_limits=-0.0,
+              energy=-0.0,
               # Feet.
               #feet_clearance=-2.0,
               #feet_height=-0.2,
@@ -129,7 +125,7 @@ def default_config() -> config_dict.ConfigDict:
       ),
       command_config=config_dict.create(
           # Uniform distribution for command amplitude.
-          a=[2.0, 0.0, 0.5],
+          a=[1.0, 0.0, 0.5],
           # Probability of not zeroing out new command.
           b=[0.9, 0.25, 0.5],
       ),
@@ -339,7 +335,6 @@ class Joystick(tita_base.TitaEnv):
         key2, shape=(3,), minval=-self._cmd_a, maxval=self._cmd_a
     )
 
-
     mpc_state = self.mpc.init_state()
     mpc_state, tita_state, dfcip_state, tau, qddot, fl, fr, desired, theta_prev = self._run_mpc_wbc(
         data=data, 
@@ -354,7 +349,7 @@ class Joystick(tita_base.TitaEnv):
 
     info = {
         "rng": rng,
-        "command": cmd,
+        "command": jp.zeros_like(cmd),
         "target_command": cmd,
         "theta_prev": theta_prev,
         "steps_until_next_cmd": steps_until_next_cmd,
@@ -373,9 +368,10 @@ class Joystick(tita_base.TitaEnv):
         "step_counter": 0,
         "mpc_state": mpc_state,
         "mpc_tau": tau,
+        "mpc_qddot": qddot,
         "dfcip_state": dfcip_state,
         "low_level_controller": {
-            #"tau_ff":      jp.zeros(self.mjx_model.nu),
+            "tau_ff":      jp.zeros(self.mjx_model.nu),
             "q_des":       jp.zeros(self.mjx_model.nu),
             "dq_des":      jp.zeros(self.mjx_model.nu),
             "qacc_joints": jp.zeros(self.mjx_model.nu),
@@ -429,6 +425,7 @@ class Joystick(tita_base.TitaEnv):
     )
 
     tau = jp.nan_to_num(tau[0], nan=0.0, posinf=0.0, neginf=0.0)
+    qddot = jp.nan_to_num(qddot, nan=0.0, posinf=0.0, neginf=0.0)
     return mpc_state, tita_state, x0, tau, qddot, fl, fr, desired, theta_prev
 
   def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
@@ -436,7 +433,7 @@ class Joystick(tita_base.TitaEnv):
       state = self._maybe_apply_perturbation(state)
     # state = self._reset_if_outside_bounds(state)
 
-    mpc_state, tita_state, dfcip_state, tau, qddot, fl, fr, desired, theta_prev = self._run_mpc_wbc(
+    new_mpc_state, tita_state, dfcip_state, new_tau, new_qddot, fl, fr, desired, theta_prev = self._run_mpc_wbc(
         data=state.data, 
         qpos=state.data.qpos, 
         qvel=state.data.qvel, 
@@ -445,15 +442,70 @@ class Joystick(tita_base.TitaEnv):
         theta_prev=state.info["theta_prev"],
         timestep=state.info["step_counter"]
         )
+    
+    def _tree_has_nonfinite(tree) -> jax.Array:
+        """True se una qualsiasi foglia float del pytree contiene NaN/Inf."""
+        leaves = jax.tree_util.tree_leaves(tree)
+        checks = [
+            jp.any(~jp.isfinite(x))
+            for x in leaves
+            if jp.issubdtype(jp.asarray(x).dtype, jp.floating)
+        ]
+        if not checks:
+            return jp.array(False)
+        return jp.stack(checks).any()
+
+
+    bad = (
+        _tree_has_nonfinite(new_mpc_state)
+        | jp.any(~jp.isfinite(new_tau))
+        | jp.any(~jp.isfinite(new_qddot))
+    )
+
+    mpc_state = jax.tree_util.tree_map(
+        lambda new, old: jp.where(bad, old, new),
+        new_mpc_state,
+        state.info["mpc_state"],
+    )
+    tau   = jp.where(bad, state.info["mpc_tau"],   new_tau)
+    qddot = jp.where(bad, state.info["mpc_qddot"], new_qddot)
+
     state.info["mpc_state"] = mpc_state
-    state.info["mpc_tau"] = tau
+    state.info["mpc_tau"]   = tau
+    state.info["mpc_qddot"] = qddot
     state.info["theta_prev"] = theta_prev
     state.info["dfcip_state"] = dfcip_state
-    
+
     def substep_fn(data, _):
-        tau_p = self._config.Kp * ( self._default_pose + action*self._config.action_scale - data.qpos[7:])
-        tau_d = self._config.Kd * ( - data.qvel[6:])
-        tau_network = tau_p.at[jnp.array([3, 7])].set(0.0) + tau_d
+        current_qddot = state.info["mpc_qddot"][0, 6:]
+        qpos = data.qpos[7:]
+        qvel = data.qvel[6:]
+        dt = self._config.sim_dt
+
+        #tau_p = self._config.Kp * ( self._default_pose + action*self._config.action_scale - data.qpos[7:])
+        #tau_d = self._config.Kd * ( - data.qvel[6:])
+        
+        #qddot_joints = current_qddot[0, 6:].at[jnp.array([3, 7])].set(0.0)
+        #q_des =  qddot_joints * (self._config.sim_dt**2)
+        #dq_des = qddot_joints * self._config.sim_dt
+        #tau_p = self._config.Kp * ( q_des + action*self._config.action_scale - data.qpos[7:])
+        #tau_d = self._config.Kd * ( dq_des - data.qvel[6:])
+
+        dq_desired = qvel + current_qddot * dt                          # ← + qvel attuale
+        q_desired  = qpos + qvel * dt + 0.5 * current_qddot * dt**2   # ← + qpos attuale
+
+        wheel_idx = jnp.array([3, 7])
+        leg_idx = jnp.array([0, 1, 2, 4, 5, 6])
+
+        action_p = action.at[wheel_idx].set(0.0)
+        action_d = action.at[leg_idx].set(0.0)
+
+        tau_p = self._config.Kp * (q_desired + action_p*self._config.action_scale - data.qpos[7:])
+        tau_d = self._config.Kd * (dq_desired + action_d*self._config.action_scale - data.qvel[6:])
+
+        tau_p = tau_p.at[jnp.array([3, 7])].set(0.0)
+
+        tau_network = tau_p + tau_d
         tau_network = tau_network*(1 - state.info["use_only_mpc"].astype(tau.dtype))
 
         motor_targets = tau + tau_network
@@ -461,7 +513,7 @@ class Joystick(tita_base.TitaEnv):
         data = data.replace(ctrl=motor_targets)
         data = mjx.step(self.mjx_model, data)
         llc_log = {
-            #"tau_ff":      tau_ff,
+            "tau_ff":      tau_network,
             "q_des":       jp.zeros_like(data.qpos[7:]),  # q_des,
             "dq_des":      jp.zeros_like(data.qvel[6:]),  # dq_des,
             "qacc_joints": jp.zeros_like(data.qvel[6:]),  # qacc_joints,
@@ -491,7 +543,7 @@ class Joystick(tita_base.TitaEnv):
     #state.info["swing_peak"] = jp.maximum(state.info["swing_peak"], p_fz)
 
     obs = self._get_obs(data, state.info)
-    done = self._get_termination(data)
+    done = self._get_termination(data) | bad
 
     rewards = self._get_reward(
         data, action, state.info, state.metrics, done, contact
@@ -499,17 +551,17 @@ class Joystick(tita_base.TitaEnv):
     rewards = {
         k: v * self._config.reward_config.scales[k] for k, v in rewards.items()
     }
-    reward = jp.clip(sum(rewards.values()) * self.dt, 0.0, 10000.0)
+    reward = jp.clip(sum(rewards.values()) * self.dt, -10000.0, 10000.0)
 
     state.info["last_last_act"] = state.info["last_act"]
     state.info["last_act"] = action
     state.info["steps_until_next_cmd"] -= 1
     state.info["rng"], key1, key2 = jax.random.split(state.info["rng"], 3)
-    state.info["target_command"] = jp.where(
-        state.info["steps_until_next_cmd"] <= 0,
-        self.sample_command(key1, state.info["target_command"]),
-        state.info["target_command"],
-    )
+    #state.info["target_command"] = jp.where(
+    #    state.info["steps_until_next_cmd"] <= 0,
+    #    self.sample_command(key1, state.info["target_command"]),
+    #    state.info["target_command"],
+    #)
     # Exponential smoothing: tau ~ 0.4s at ctrl_dt=0.02s
     state.info["command"] = (
         state.info["command"]
@@ -600,7 +652,7 @@ class Joystick(tita_base.TitaEnv):
         noisy_linvel,  # 3
         noisy_gyro,  # 3
         noisy_gravity,  # 3
-        noisy_joint_angles - self._default_pose,  # 12
+        noisy_joint_angles, # - self._default_pose,  # 12
         noisy_joint_vel,  # 12
         info["last_act"],  # 12
         info["command"],  # 3
@@ -618,7 +670,7 @@ class Joystick(tita_base.TitaEnv):
         gravity,  # 3
         linvel,  # 3
         angvel,  # 3
-        joint_angles - self._default_pose,  # 12
+        joint_angles, # - self._default_pose,  # 12
         joint_vel,  # 12
         data.actuator_force,  # 12
         info["last_contact"],  # 4
@@ -626,7 +678,6 @@ class Joystick(tita_base.TitaEnv):
         #info["feet_air_time"],  # 4
         data.xfrc_applied[self._torso_body_id, :3],  # 3
         info["steps_since_last_pert"] >= info["steps_until_next_pert"],  # 1
-        dfcip_state,  # 18
     ])
 
     return {
@@ -653,19 +704,24 @@ class Joystick(tita_base.TitaEnv):
         "tracking_ang_vel": self._reward_tracking_ang_vel(
             info["command"], self.get_gyro(data)
         ),
-        "lin_vel_z": self._cost_lin_vel_z(self.get_global_linvel(data)),
-        "ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
-        #"orientation": self._cost_orientation(self.get_upvector(data)),
-        "base_height": self._reward_height(data.qpos[2]),
-        "orientation": self._reward_orientation(current_up, jp.array([0, 0, 1])),
-        "stand_still": self._cost_stand_still(info["command"], data.qpos[7:]),
-        "termination": self._cost_termination(done),
-        "pose": self._reward_pose(data.qpos[7:]),
-        "torques": self._cost_torques(data.actuator_force),
-        "action_rate": self._cost_action_rate(
+        "action_rate_first_order": self._cost_action_rate_first_order(
+            action, info["last_act"]
+        ),
+        "action_rate_second_order": self._cost_action_rate_second_order(
             action, info["last_act"], info["last_last_act"]
         ),
-        "energy": self._cost_energy(data.qvel[6:], data.actuator_force),
+
+        "torques": self._cost_torques(data.actuator_force),
+        "orientation": self._reward_orientation(data),
+        "base_height": self._reward_height(data.sensordata[self._base_com_adr][2]),
+        "joint_regularization": self._joint_regularization(data.qpos[7:]),
+        "termination": self._cost_termination(done),
+
+        #"lin_vel_z": self._cost_lin_vel_z(self.get_global_linvel(data)),
+        #"ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
+        
+        #"energy": self._cost_energy(data.qvel[6:], data.actuator_force),
+
         #"feet_slip": self._cost_feet_slip(data, contact, info),
         #"feet_clearance": self._cost_feet_clearance(data),
         #"feet_height": self._cost_feet_height(
@@ -674,7 +730,7 @@ class Joystick(tita_base.TitaEnv):
         #"feet_air_time": self._reward_feet_air_time(
         #    info["feet_air_time"], first_contact, info["command"]
         #),
-        "dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
+        #"dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
     }
 
   # Tracking rewards.
@@ -685,8 +741,15 @@ class Joystick(tita_base.TitaEnv):
       local_vel: jax.Array,
   ) -> jax.Array:
     # Tracking of linear velocity commands (xy axes).
-    lin_vel_error = jp.sum(jp.square(commands[:2] - local_vel[:2]))
-    return jp.exp(-lin_vel_error / self._config.reward_config.tracking_sigma)
+    cmd_curent = commands[:2]
+    local_vel_current = local_vel[:2]
+    
+    term_error = (cmd_curent - local_vel_current) / (1 + jp.abs(cmd_curent))
+    term_norm = jp.sum(jp.square(term_error))
+
+    reward = jp.exp( - term_norm / self._config.reward_config.tracking_sigma )
+
+    return reward
 
   def _reward_tracking_ang_vel(
       self,
@@ -694,8 +757,15 @@ class Joystick(tita_base.TitaEnv):
       ang_vel: jax.Array,
   ) -> jax.Array:
     # Tracking of angular velocity commands (yaw).
-    ang_vel_error = jp.square(commands[2] - ang_vel[2])
-    return jp.exp(-ang_vel_error / self._config.reward_config.tracking_sigma)
+    cmd_current = commands[2]
+    local_ang_vel_current = ang_vel[2]
+
+    term_error = cmd_current - local_ang_vel_current
+    term_norm = jp.square(term_error)
+
+    reward = jp.exp( - term_norm / self._config.reward_config.tracking_sigma)
+
+    return reward
 
   # Base related rewards
   def _cost_lin_vel_z(self, global_linvel: jax.Array) -> jax.Array:
@@ -707,24 +777,34 @@ class Joystick(tita_base.TitaEnv):
     return jp.sum(jp.square(global_angvel[:2]))
 
   def _reward_orientation(
-      self, current_up_vec: jax.Array, target_up_vec: jax.Array
+      self, data: mjx.Data
   ) -> jax.Array:
-    cos_dist = jp.dot(current_up_vec, target_up_vec)
-    normalized = 0.5 * cos_dist + 0.5
-    return jp.square(normalized)
+    term_error = self.get_gravity(data)[:2]
+    term_norm = jp.sum(jp.square(term_error))
+
+    reward = jp.exp(-term_norm / self._config.reward_config.tracking_sigma)
+
+    return reward
   
   def _cost_orientation(self, torso_zaxis: jax.Array) -> jax.Array:
     # Penalize non flat base orientation.
     return jp.sum(jp.square(torso_zaxis[:2]))
 
   def _reward_height(self, body_height: jax.Array) -> jax.Array:
-    error = self._init_q[2] - body_height 
-    return jp.exp(-error / 1.0)
+    term_error = self._config.reward_config.base_height_target - body_height
+    term_norm = jp.sum(jp.square(term_error))
+
+    reward = jp.exp(-term_norm / self._config.reward_config.tracking_sigma)
+
+    return reward
 
   # Energy related rewards.
   def _cost_torques(self, torques: jax.Array) -> jax.Array:
     # Penalize torques.
-    return jp.sqrt(jp.sum(jp.square(torques))) + jp.sum(jp.abs(torques))
+
+    cost = jp.sum(jp.square(torques))
+
+    return cost
 
   def _cost_energy(
       self, qvel: jax.Array, qfrc_actuator: jax.Array
@@ -732,18 +812,35 @@ class Joystick(tita_base.TitaEnv):
     # Penalize energy consumption.
     return jp.sum(jp.abs(qvel) * jp.abs(qfrc_actuator))
 
-  def _cost_action_rate(
+  def _cost_action_rate_first_order(
+      self, act: jax.Array, last_act: jax.Array
+  ) -> jax.Array:
+    
+    term_error = (act - last_act)/self._config.ctrl_dt
+    term_norm = jp.sum(jp.square(term_error))
+
+    cost = term_norm  
+
+    return cost
+
+  def _cost_action_rate_second_order(
       self, act: jax.Array, last_act: jax.Array, last_last_act: jax.Array
   ) -> jax.Array:
-    del last_last_act  # Unused.
-    return jp.sum(jp.square(act - last_act))
+
+    term_error = (act - 2 * last_act + last_last_act)/self._config.ctrl_dt
+    term_norm = jp.sum(jp.square(term_error))
+
+    cost = term_norm 
+
+    return cost
 
   # Other rewards.
 
-  def _reward_pose(self, qpos: jax.Array) -> jax.Array:
+  def _joint_regularization(self, qpos: jax.Array) -> jax.Array:
     # Stay close to the default pose.
     weight = jp.array([1.0, 1.0, 1.0, 0.0] * 2)
-    return jp.exp(-jp.sum(jp.square(qpos - self._default_pose) * weight))
+    scale = (1/(self._mj_model.nu-2))
+    return scale * jp.sum(jp.square(qpos - self._default_pose) * weight)
 
   def _cost_stand_still(
       self,
