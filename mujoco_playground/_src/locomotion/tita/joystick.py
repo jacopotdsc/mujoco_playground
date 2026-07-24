@@ -102,7 +102,7 @@ def default_config() -> config_dict.ConfigDict:
               torques=-0.0001,
               orientation=1.0,
               base_height=1.0,
-              joint_regularization=1.0,
+              joint_regularization=-1.0,
               termination=-100.0,
 
               lin_vel_z=0.0,
@@ -399,7 +399,7 @@ class Joystick(tita_base.TitaEnv):
         jp.array(False),
         jp.zeros(len(self._feet_geom_id), dtype=bool),
     )
-    
+
     dummy_rewards = {
         k: v * self._config.reward_config.scales[k] for k, v in dummy_rewards.items()
     }
