@@ -95,8 +95,10 @@ def default_config() -> config_dict.ConfigDict:
           scales=config_dict.create(
               tracking_lin_vel=10.0, 
               tracking_ang_vel=5.0, 
-              action_rate_first_order=-0.001,
-              action_rate_second_order=-0.0001,
+              virtual_unicycle_lin=0.0,
+              virtual_unicycle_ang=0.0,
+              action_rate_first_order=-0.000,
+              action_rate_second_order=-0.0000,
               torques=-0.0001,
               orientation=1.0,
               base_height=1.0,
@@ -106,7 +108,7 @@ def default_config() -> config_dict.ConfigDict:
               lin_vel_z=0.0,
               ang_vel_xy=0.0,
               dof_pos_limits=-0.0,
-              energy=-0.0,
+              energy=-0.0001,
               # Feet.
               #feet_clearance=-2.0,
               #feet_height=-0.2,
@@ -125,7 +127,7 @@ def default_config() -> config_dict.ConfigDict:
       ),
       command_config=config_dict.create(
           # Uniform distribution for command amplitude.
-          a=[1.0, 0.0, 0.5],
+          a=[2.0, 0.0, 0.5],
           # Probability of not zeroing out new command.
           b=[0.9, 0.25, 0.5],
       ),
@@ -200,6 +202,7 @@ class Joystick(tita_base.TitaEnv):
     self.mpc_period = max(1, int(sim_frequency / config.mpc_frequency))
     self.mpc = BatchedMPCControllerWrapper(config, 1)
     self._wheel_radius = jp.array([self._mj_model.geom(name).size[0] for name in consts.FEET_GEOMS])
+    self._wheel_base = self.mpc.config.d
 
   def build_tita_state(self, data: mjx.Data) -> jax.Array:
     # CoM pos/vel dai sensori subtree (già JAX)
@@ -341,6 +344,7 @@ class Joystick(tita_base.TitaEnv):
         qpos=data.qpos, 
         qvel=data.qvel, 
         command=cmd,
+        action=jp.zeros(self.mjx_model.nu),
         mpc_state=mpc_state,
         theta_prev=0.0,
         timestep=0
@@ -353,8 +357,8 @@ class Joystick(tita_base.TitaEnv):
         "target_command": cmd,
         "theta_prev": theta_prev,
         "steps_until_next_cmd": steps_until_next_cmd,
-        "last_act": jp.zeros(self.mjx_model.nu),
-        "last_last_act": jp.zeros(self.mjx_model.nu),
+        "last_act": jp.zeros(self.action_size),
+        "last_last_act": jp.zeros(self.action_size),
         #"feet_air_time": jp.zeros(2),
         "last_contact": jp.zeros(2, dtype=bool),
         #"swing_peak": jp.zeros(2),
@@ -380,11 +384,27 @@ class Joystick(tita_base.TitaEnv):
             "kp":          jp.zeros(()),
             "kd":          jp.zeros(()),
             "action_scale": jp.zeros(()),
-            "action":      jp.zeros(self.mjx_model.nu),
+            "action":      jp.zeros(self.action_size),
             "qpos":        jp.zeros(self.mjx_model.nq),
         },
+        "reward_terms": {},
         "use_only_mpc": False,
     }
+
+    dummy_rewards = self._get_reward(
+        data,
+        jp.zeros(self.mjx_model.nu),
+        info,
+        {},
+        jp.array(False),
+        jp.zeros(len(self._feet_geom_id), dtype=bool),
+    )
+    
+    dummy_rewards = {
+        k: v * self._config.reward_config.scales[k] for k, v in dummy_rewards.items()
+    }
+
+    info["reward_terms"] = dummy_rewards
 
     metrics = {}
     for k in self._config.reward_config.scales.keys():
@@ -395,7 +415,7 @@ class Joystick(tita_base.TitaEnv):
     reward, done = jp.zeros(2)
     return mjx_env.State(data, obs, reward, done, metrics, info)
   
-  def _run_mpc_wbc(self, data, qpos: jax.Array, qvel: jax.Array, command: jax.Array, mpc_state, theta_prev, timestep: int):
+  def _run_mpc_wbc(self, data, qpos: jax.Array, qvel: jax.Array, command: jax.Array, action, mpc_state, theta_prev, timestep: int):
     """Run the MPC planner (called every mpc_period steps)."""
     qpos = jp.nan_to_num(qpos, nan=0.0, posinf=0.0, neginf=0.0)
     qvel = jp.nan_to_num(qvel, nan=0.0, posinf=0.0, neginf=0.0)
@@ -413,6 +433,11 @@ class Joystick(tita_base.TitaEnv):
     dpl_world_wbc = tita_state[12:15][None, :]
     dpr_world_wbc = tita_state[15:18][None, :]
 
+    joint_scale = 0.1
+    wheel_scale = 1.0
+    scaled_weights = jp.array([joint_scale, joint_scale, joint_scale, wheel_scale]*2)
+    scaled_action = action #* scaled_weights
+
     mpc_state, tau, qddot, fl, fr, desired = self.mpc.whole_body_run(
         mpc_state,
         x0,
@@ -422,6 +447,8 @@ class Joystick(tita_base.TitaEnv):
         pr_world_wbc,
         dpl_world_wbc,
         dpr_world_wbc,
+        #scaled_action[None, :],
+        use_nn=False
     )
 
     tau = jp.nan_to_num(tau[0], nan=0.0, posinf=0.0, neginf=0.0)
@@ -438,6 +465,7 @@ class Joystick(tita_base.TitaEnv):
         qpos=state.data.qpos, 
         qvel=state.data.qvel, 
         command=state.info["command"],
+        action=action,
         mpc_state=state.info["mpc_state"],
         theta_prev=state.info["theta_prev"],
         timestep=state.info["step_counter"]
@@ -484,15 +512,6 @@ class Joystick(tita_base.TitaEnv):
 
         #tau_p = self._config.Kp * ( self._default_pose + action*self._config.action_scale - data.qpos[7:])
         #tau_d = self._config.Kd * ( - data.qvel[6:])
-        
-        #qddot_joints = current_qddot[0, 6:].at[jnp.array([3, 7])].set(0.0)
-        #q_des =  qddot_joints * (self._config.sim_dt**2)
-        #dq_des = qddot_joints * self._config.sim_dt
-        #tau_p = self._config.Kp * ( q_des + action*self._config.action_scale - data.qpos[7:])
-        #tau_d = self._config.Kd * ( dq_des - data.qvel[6:])
-
-        dq_desired = qvel + current_qddot * dt                          # ← + qvel attuale
-        q_desired  = qpos + qvel * dt + 0.5 * current_qddot * dt**2   # ← + qpos attuale
 
         wheel_idx = jnp.array([3, 7])
         leg_idx = jnp.array([0, 1, 2, 4, 5, 6])
@@ -500,8 +519,24 @@ class Joystick(tita_base.TitaEnv):
         action_p = action.at[wheel_idx].set(0.0)
         action_d = action.at[leg_idx].set(0.0)
 
-        tau_p = self._config.Kp * (q_desired + action_p*self._config.action_scale - data.qpos[7:])
-        tau_d = self._config.Kd * (dq_desired + action_d*self._config.action_scale - data.qvel[6:])
+        dq_desired = qvel + current_qddot * dt                          # ← + qvel attuale
+        q_desired  = qpos + qvel * dt + 0.5 * current_qddot * dt**2   # ← + qpos attuale
+
+        #qddot_joints = current_qddot[0, 6:].at[jnp.array([3, 7])].set(0.0)
+        #q_des =  qddot_joints * (self._config.sim_dt**2)
+        #dq_des = qddot_joints * self._config.sim_dt
+        tau_p = self._config.Kp * ( q_desired + action_p*self._config.action_scale - data.qpos[7:])
+        tau_d = self._config.Kd * ( dq_desired + action_d*self._config.action_scale - data.qvel[6:])
+
+        body_pw = 35.0
+        wheel_pw = 0.0
+        body_dw = 0.5
+        wheel_dw = 10.0
+        p_weights = jp.array([body_pw, body_pw, body_pw, wheel_pw]*2)
+        d_weights = jp.array([body_dw, body_dw, body_dw, wheel_dw]*2)
+
+        #tau_p = p_weights * (q_desired - data.qpos[7:])
+        #tau_d = d_weights * (dq_desired - data.qvel[6:])
 
         tau_p = tau_p.at[jnp.array([3, 7])].set(0.0)
 
@@ -553,19 +588,21 @@ class Joystick(tita_base.TitaEnv):
     }
     reward = jp.clip(sum(rewards.values()) * self.dt, -10000.0, 10000.0)
 
+    state.info["reward_terms"] = rewards
+
     state.info["last_last_act"] = state.info["last_act"]
     state.info["last_act"] = action
     state.info["steps_until_next_cmd"] -= 1
     state.info["rng"], key1, key2 = jax.random.split(state.info["rng"], 3)
-    #state.info["target_command"] = jp.where(
-    #    state.info["steps_until_next_cmd"] <= 0,
-    #    self.sample_command(key1, state.info["target_command"]),
-    #    state.info["target_command"],
-    #)
+    state.info["target_command"] = jp.where(
+        state.info["steps_until_next_cmd"] <= 0,
+        self.sample_command(key1, state.info["target_command"]),
+        state.info["target_command"],
+    )
     # Exponential smoothing: tau ~ 0.4s at ctrl_dt=0.02s
     state.info["command"] = (
         state.info["command"]
-        + 0.005 * (state.info["target_command"] - state.info["command"])
+        + 0.02 * (state.info["target_command"] - state.info["command"])
     )
     state.info["steps_until_next_cmd"] = jp.where(
         done | (state.info["steps_until_next_cmd"] <= 0),
@@ -655,6 +692,7 @@ class Joystick(tita_base.TitaEnv):
         noisy_joint_angles, # - self._default_pose,  # 12
         noisy_joint_vel,  # 12
         info["last_act"],  # 12
+        info["last_last_act"],  # 12
         info["command"],  # 3
         noisy_dfcip_state,  # 18
     ])
@@ -704,6 +742,12 @@ class Joystick(tita_base.TitaEnv):
         "tracking_ang_vel": self._reward_tracking_ang_vel(
             info["command"], self.get_gyro(data)
         ),
+        #"virtual_unicycle_lin": self._reward_virtual_unicycle_lin(
+        #    info["command"], data.qvel
+        #),
+        #"virtual_unicycle_ang": self._reward_virtual_unicycle_ang(
+        #    info["command"], data.qvel
+        #),
         "action_rate_first_order": self._cost_action_rate_first_order(
             action, info["last_act"]
         ),
@@ -714,13 +758,13 @@ class Joystick(tita_base.TitaEnv):
         "torques": self._cost_torques(data.actuator_force),
         "orientation": self._reward_orientation(data),
         "base_height": self._reward_height(data.sensordata[self._base_com_adr][2]),
-        "joint_regularization": self._joint_regularization(data.qpos[7:]),
+        "joint_regularization": self._cost_joint_regularization(data.qpos[7:]),
         "termination": self._cost_termination(done),
 
         #"lin_vel_z": self._cost_lin_vel_z(self.get_global_linvel(data)),
         #"ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
         
-        #"energy": self._cost_energy(data.qvel[6:], data.actuator_force),
+        "energy": self._cost_energy(data.qvel[6:], data.actuator_force),
 
         #"feet_slip": self._cost_feet_slip(data, contact, info),
         #"feet_clearance": self._cost_feet_clearance(data),
@@ -735,6 +779,25 @@ class Joystick(tita_base.TitaEnv):
 
   # Tracking rewards.
 
+  def _virtual_unicycle_vel(self, qvel: jax.Array) -> jax.Array:
+    """Velocita' (v, omega) del unicycle virtuale ricavate dalle due ruote.
+ 
+    v     = r * (w_l + w_r) / 2
+    omega = r * (w_r - w_l) / L
+    """
+    qj = qvel[6:]  # qvel[6:] contiene le velocità delle ruote e delle gambe
+    w_lx = qj[3]
+    w_rx = qj[7]
+
+    # self._wheel_radius = [r_sx, r_dx], stesso ordine di w_sx / w_dx
+    v_lx = self._wheel_radius[0] * w_lx
+    v_rx = self._wheel_radius[1] * w_rx
+
+    v = 0.5 * (v_lx + v_rx)
+    omega = (v_rx - v_lx) / self._wheel_base
+
+    return jp.array([v, omega])
+
   def _reward_tracking_lin_vel(
       self,
       commands: jax.Array,
@@ -748,8 +811,10 @@ class Joystick(tita_base.TitaEnv):
     term_norm = jp.sum(jp.square(term_error))
 
     reward = jp.exp( - term_norm / self._config.reward_config.tracking_sigma )
-
     return reward
+
+    #lin_vel_error = jp.sum(jp.square(commands[:2] - local_vel[:2]))
+    #return jp.exp(-lin_vel_error / self._config.reward_config.tracking_sigma)
 
   def _reward_tracking_ang_vel(
       self,
@@ -764,8 +829,42 @@ class Joystick(tita_base.TitaEnv):
     term_norm = jp.square(term_error)
 
     reward = jp.exp( - term_norm / self._config.reward_config.tracking_sigma)
-
     return reward
+
+    #ang_vel_error = jp.square(commands[2] - ang_vel[2])
+    #return jp.exp(-ang_vel_error / self._config.reward_config.tracking_sigma)
+
+  def _reward_virtual_unicycle_lin(
+        self,
+        commands: jax.Array,
+        qvel: jax.Array,
+    ) -> jax.Array:
+        # Tracking del comando di velocita' lineare con la velocita' delle ruote.
+        cmd_current = commands[0]
+        wheel_lin_vel_current = self._virtual_unicycle_vel(qvel)[0]
+    
+        term_error = cmd_current - wheel_lin_vel_current
+        term_norm = jp.square(term_error)
+    
+        reward = jp.exp(-term_norm / self._config.reward_config.tracking_sigma)
+    
+        return reward
+
+  def _reward_virtual_unicycle_ang(
+        self,
+        commands: jax.Array,
+        qvel: jax.Array,
+    ) -> jax.Array:
+        # Tracking del comando di yaw rate con la velocita' differenziale delle ruote.
+        cmd_current = commands[2]
+        wheel_ang_vel_current = self._virtual_unicycle_vel(qvel)[1]
+    
+        term_error = cmd_current - wheel_ang_vel_current
+        term_norm = jp.square(term_error)
+    
+        reward = jp.exp(-term_norm / self._config.reward_config.tracking_sigma)
+    
+        return reward
 
   # Base related rewards
   def _cost_lin_vel_z(self, global_linvel: jax.Array) -> jax.Array:
@@ -804,13 +903,16 @@ class Joystick(tita_base.TitaEnv):
 
     cost = jp.sum(jp.square(torques))
 
+    #return jp.sqrt(jp.sum(jp.square(torques))) + jp.sum(jp.abs(torques))
     return cost
 
   def _cost_energy(
       self, qvel: jax.Array, qfrc_actuator: jax.Array
   ) -> jax.Array:
     # Penalize energy consumption.
+    #power = qfrc_actuator * qvel
     return jp.sum(jp.abs(qvel) * jp.abs(qfrc_actuator))
+    #return jp.sum(jp.maximum(power, 0.0))
 
   def _cost_action_rate_first_order(
       self, act: jax.Array, last_act: jax.Array
@@ -836,7 +938,7 @@ class Joystick(tita_base.TitaEnv):
 
   # Other rewards.
 
-  def _joint_regularization(self, qpos: jax.Array) -> jax.Array:
+  def _cost_joint_regularization(self, qpos: jax.Array) -> jax.Array:
     # Stay close to the default pose.
     weight = jp.array([1.0, 1.0, 1.0, 0.0] * 2)
     scale = (1/(self._mj_model.nu-2))

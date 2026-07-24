@@ -1,5 +1,5 @@
-<mujoco model="aliengo scene">
-  <include file="aliengo.xml"/>
+<mujoco model="tita scene">
+  <include file="tita.xml"/>
 
   <statistic center="0 0 0.1" extent="0.8" />
 

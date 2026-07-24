@@ -43,6 +43,7 @@ def task_to_xml(task_name: str) -> epath.Path:
   return {
       "flat_terrain": FEET_ONLY_FLAT_TERRAIN_XML,
       "rough_terrain": FEET_ONLY_ROUGH_TERRAIN_XML,
+      "perlin_terrain": FEET_ONLY_PERLIN_TERRAIN_XML,
   }[task_name]
 
 

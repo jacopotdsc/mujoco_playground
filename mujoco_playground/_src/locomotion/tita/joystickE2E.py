@@ -34,8 +34,8 @@ def geoms_colliding(state: mjx.Data, geom1: int, geom2: int) -> jax.Array:
 
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
-      ctrl_dt=0.02,      # = sim_dt * decimation in Isaac
-      sim_dt=0.004,
+      ctrl_dt=0.01,      # = sim_dt * decimation in Isaac
+      sim_dt=0.002,
       episode_length=1000,
       # PD (Isaac: cfg.control.stiffness / damping).
       Kp=80.0,
@@ -147,7 +147,7 @@ def default_config() -> config_dict.ConfigDict:
           # I comandi piccoli vengono azzerati (come in Isaac).
           zero_command_threshold=0.2,
       ),
-      impl="warp",
+      impl="jax",
       naconmax=16 * 8192,
       njmax=40,
   )
@@ -249,22 +249,22 @@ class Joystick(tita_base.TitaEnv):
     # x,y = +U(-0.5, 0.5), yaw = U(-pi, pi).
     rng, key = jax.random.split(rng)
     dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
-    qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
+    #qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
     rng, key = jax.random.split(rng)
     yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
     quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
-    qpos = qpos.at[3:7].set(math.quat_mul(qpos[3:7], quat))
+    #qpos = qpos.at[3:7].set(math.quat_mul(qpos[3:7], quat))
 
     # Isaac _reset_dofs: dof_pos = default * U(0.5, 1.5), dof_vel = 0.
     rng, key = jax.random.split(rng)
     scale = jax.random.uniform(key, (consts.NUM_DOFS,), minval=0.5, maxval=1.5)
-    qpos = qpos.at[7:].set(self._default_pose * scale)
+    #qpos = qpos.at[7:].set(self._default_pose * scale)
 
     # Isaac _reset_root_states: vel base U(-0.5, 0.5).
     rng, key = jax.random.split(rng)
-    qvel = qvel.at[0:6].set(
-        jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5)
-    )
+    #qvel = qvel.at[0:6].set(
+    #    jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5)
+    #)
 
     ctrl = jp.zeros(self.mjx_model.nu)
     ctrl = ctrl.at[self._leg_ids].set(qpos[7:][self._leg_ids])
