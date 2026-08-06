@@ -56,9 +56,13 @@ class Go1Env(mjx_env.MjxEnv):
     self._mj_model.opt.ccd_iterations = 20
 
     # Modify PD gains.
-    self._mj_model.dof_damping[6:] = config.Kd
-    self._mj_model.actuator_gainprm[:, 0] = config.Kp
-    self._mj_model.actuator_biasprm[:, 1] = -config.Kp
+    #self._mj_model.dof_damping[6:] = config.Kd
+    #self._mj_model.actuator_gainprm[:, 0] = config.Kp
+    #self._mj_model.actuator_biasprm[:, 1] = -config.Kp
+
+    self._mj_model.dof_damping[6:] = 0.0
+    self._mj_model.actuator_gainprm[:, 0] = 1.0
+    self._mj_model.actuator_biasprm[:, 1] = 0.0
 
     # Increase offscreen framebuffer size to render at higher resolutions.
     self._mj_model.vis.global_.offwidth = 3840

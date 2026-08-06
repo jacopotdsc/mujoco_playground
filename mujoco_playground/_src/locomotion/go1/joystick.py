@@ -30,8 +30,8 @@ from mujoco_playground._src.locomotion.go1 import go1_constants as consts
 
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
-      ctrl_dt=0.02,
-      sim_dt=0.004,
+      ctrl_dt=0.01,
+      sim_dt=0.002,
       episode_length=1000,
       Kp=35.0,
       Kd=0.5,
@@ -113,6 +113,11 @@ class Joystick(go1_base.Go1Env):
         config_overrides=config_overrides,
     )
     self._post_init()
+
+    #print("biastype ", self.mj_model.actuator_biastype)   # 0 = motor puro; !=0 = affine (position)
+    #print("gainprm0 ", self.mj_model.actuator_gainprm[:, 0])
+    #print("biasprm1 ", self.mj_model.actuator_biasprm[:, 1])
+    #print("ctrlrange", self.mj_model.actuator_ctrlrange)
 
   def _post_init(self) -> None:
     self._init_q = jp.array(self._mj_model.keyframe("home").qpos)
@@ -226,6 +231,9 @@ class Joystick(go1_base.Go1Env):
         "pert_steps": 0,
         "pert_dir": jp.zeros(3),
         "pert_mag": pert_mag,
+        "rewards_terms": {
+            k: jp.zeros(()) for k in self._config.reward_config.scales.keys()
+        },
     }
 
     metrics = {}
@@ -250,10 +258,32 @@ class Joystick(go1_base.Go1Env):
       state = self._maybe_apply_perturbation(state)
     # state = self._reset_if_outside_bounds(state)
 
-    motor_targets = self._default_pose + action * self._config.action_scale
-    data = mjx_env.step(
-        self.mjx_model, state.data, motor_targets, self.n_substeps
-    )
+    #motor_targets = self._default_pose + action * self._config.action_scale
+    #data = mjx_env.step(
+    #    self.mjx_model, state.data, motor_targets, self.n_substeps
+    #)
+    
+    def substep_fn(data, _):
+        q = data.qpos[7:]
+        dq = data.qvel[6:]
+
+        q_des = self._default_pose + action * self._config.action_scale
+        tau_p = self._config.Kp * (q_des - q)
+
+        dq_des = jp.zeros_like(dq)
+        tau_d = self._config.Kd * (dq_des - dq)
+
+        # Clip dei torque (Isaac: clip(torques, ±torque_limits)).
+        torque_limits = 100
+        tau = jp.clip(tau_p + tau_d, -torque_limits, torque_limits)
+
+        data = data.replace(ctrl=tau)
+        data = mjx.step(self.mjx_model, data)
+        
+        return data, None
+
+    data, _ = jax.lax.scan(substep_fn, state.data, None, length=self.n_substeps)
+    state = state.replace(data=data)
 
     contact = jp.array([
         data.sensordata[self._mj_model.sensor_adr[sensorid]] > 0
@@ -276,6 +306,8 @@ class Joystick(go1_base.Go1Env):
         k: v * self._config.reward_config.scales[k] for k, v in rewards.items()
     }
     reward = jp.clip(sum(rewards.values()) * self.dt, 0.0, 10000.0)
+
+    state.info["rewards_terms"] = rewards
 
     state.info["last_last_act"] = state.info["last_act"]
     state.info["last_act"] = action
