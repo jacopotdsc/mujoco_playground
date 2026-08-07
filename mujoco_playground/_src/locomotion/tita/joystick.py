@@ -77,8 +77,9 @@ def default_config() -> config_dict.ConfigDict:
       episode_length=1000,
       Kp=35.0,
       Kd=10.0,
+      Kd_wheel=0.5,
       action_repeat=1,
-      action_scale=0.1,
+      action_scale=1.0,
       history_len=1,
       soft_joint_pos_limit_factor=0.95,
       noise_config=config_dict.create(
@@ -101,7 +102,7 @@ def default_config() -> config_dict.ConfigDict:
               action_rate_second_order=-0.0000,
               torques=-0.0001,
               orientation=1.0,
-              base_height=1.0,
+              base_height=-50.0,
               joint_regularization=-1.0,
               termination=-100.0,
 
@@ -109,6 +110,7 @@ def default_config() -> config_dict.ConfigDict:
               ang_vel_xy=0.0,
               dof_pos_limits=-0.0,
               energy=-0.0001,
+              wheel_track=-1.0,
               # Feet.
               #feet_clearance=-2.0,
               #feet_height=-0.2,
@@ -118,6 +120,7 @@ def default_config() -> config_dict.ConfigDict:
           tracking_sigma=0.25,
           max_foot_height=0.1,
           base_height_target=0.40,
+          wheel_track_target=0.567,  # nominal distance between the two wheels (m), same as MPC's config.d
       ),
       pert_config=config_dict.create(
           enable=False,
@@ -127,7 +130,7 @@ def default_config() -> config_dict.ConfigDict:
       ),
       command_config=config_dict.create(
           # Uniform distribution for command amplitude.
-          a=[2.0, 0.0, 0.5],
+          a=[0.0, 0.0, 0.0],
           # Probability of not zeroing out new command.
           b=[0.9, 0.25, 0.5],
       ),
@@ -757,9 +760,10 @@ class Joystick(tita_base.TitaEnv):
 
         "torques": self._cost_torques(data.actuator_force),
         "orientation": self._reward_orientation(data),
-        "base_height": self._reward_height(data.sensordata[self._base_com_adr][2]),
+        "base_height": self._cost_height(data.sensordata[self._base_com_adr][2]),
         "joint_regularization": self._cost_joint_regularization(data.qpos[7:]),
         "termination": self._cost_termination(done),
+        "wheel_track": self._cost_wheel_track(data),
 
         #"lin_vel_z": self._cost_lin_vel_z(self.get_global_linvel(data)),
         #"ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
@@ -889,13 +893,18 @@ class Joystick(tita_base.TitaEnv):
     # Penalize non flat base orientation.
     return jp.sum(jp.square(torso_zaxis[:2]))
 
-  def _reward_height(self, body_height: jax.Array) -> jax.Array:
+  def _cost_height(self, body_height: jax.Array) -> jax.Array:
+    # Quadratic penalty instead of exp(-error^2/sigma): the latter saturates
+    # near 1 for height errors of a few cm, making the robot barely feel it.
     term_error = self._config.reward_config.base_height_target - body_height
-    term_norm = jp.sum(jp.square(term_error))
+    return jp.sum(jp.square(term_error))
 
-    reward = jp.exp(-term_norm / self._config.reward_config.tracking_sigma)
-
-    return reward
+  def _cost_wheel_track(self, data: mjx.Data) -> jax.Array:
+    # Penalize the real wheel-to-wheel distance drifting from the nominal
+    # track width the MPC/WBC assume (config_dfcip.d = 0.567 m).
+    feet_pos = data.site_xpos[self._feet_site_id]
+    dist = jp.linalg.norm(feet_pos[0] - feet_pos[1])
+    return jp.square(dist - self._config.reward_config.wheel_track_target)
 
   # Energy related rewards.
   def _cost_torques(self, torques: jax.Array) -> jax.Array:

@@ -50,8 +50,8 @@ def geoms_colliding(state: mjx.Data, geom1: int, geom2: int) -> jax.Array:
 
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
-      ctrl_dt=0.02,
-      sim_dt=0.004,
+      ctrl_dt=0.01,
+      sim_dt=0.002,
       episode_length=1000,
       Kp=70.0,
       Kd=0.5,
@@ -346,7 +346,25 @@ class Joystick(aliengo_base.AliengoEnv):
         "pert_mag": pert_mag,
         #"mpc_state": mpc_state,
         #"mpc_tau": tau,
+        "reward_terms" : {}
     }
+
+    dummy_rewards = self._get_reward(
+        data,
+        jp.zeros(self.mjx_model.nu),
+        info,
+        {},
+        jp.array(False),
+        jp.array(False),
+        jp.zeros(len(self._feet_geom_id), dtype=bool),
+    )
+
+    dummy_rewards = {
+        k: v * self._config.reward_config.scales[k] for k, v in dummy_rewards.items()
+    }
+
+    info["reward_terms"] = dummy_rewards
+
 
     metrics = {}
     for k in self._config.reward_config.scales.keys():
@@ -395,13 +413,13 @@ class Joystick(aliengo_base.AliengoEnv):
         data = mjx.step(self.mjx_model, data)
         return data, None
 
-    #data, _ = jax.lax.scan(substep_fn, state.data, None, length=self.n_substeps)
-    #state = state.replace(data=data)
+    data, _ = jax.lax.scan(substep_fn, state.data, None, length=self.n_substeps)
+    state = state.replace(data=data)
 
-    motor_targets = self._default_pose + action * self._config.action_scale
-    data = mjx_env.step(
-        self.mjx_model, state.data, motor_targets, self.n_substeps
-    )
+    #motor_targets = self._default_pose + action * self._config.action_scale
+    #data = mjx_env.step(
+    #    self.mjx_model, state.data, motor_targets, self.n_substeps
+    #)
     
     contact = jp.array([
         data.sensordata[self._mj_model.sensor_adr[sensorid]] > 0
@@ -425,6 +443,8 @@ class Joystick(aliengo_base.AliengoEnv):
     }
     reward = jp.clip(sum(rewards.values()) * self.dt, 0.0, 10000.0)
 
+    state.info["reward_terms"] = rewards
+    
     state.info["last_last_act"] = state.info["last_act"]
     state.info["last_act"] = action
     state.info["steps_until_next_cmd"] -= 1

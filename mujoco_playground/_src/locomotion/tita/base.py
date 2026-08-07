@@ -69,7 +69,7 @@ class TitaEnv(mjx_env.MjxEnv):
 
     # gainprm ha anche componenti [1],[2]: azzerale per sicurezza sui gain
     self._mj_model.actuator_gainprm[:, 1:3] = 0.0
-    
+
     # Increase offscreen framebuffer size to render at higher resolutions.
     self._mj_model.vis.global_.offwidth = 3840
     self._mj_model.vis.global_.offheight = 2160
@@ -78,6 +78,10 @@ class TitaEnv(mjx_env.MjxEnv):
     self._xml_path = xml_path
     self._imu_site_id = self._mj_model.site("imu").id
 
+    self._feet_floor_found_sensor = [
+        self._mj_model.sensor(name).id
+        for name in consts.FEET_FLOOR_FOUND_SENSORS
+    ]
   # Sensor readings.
   
   def get_upvector(self, data: mjx.Data) -> jax.Array:

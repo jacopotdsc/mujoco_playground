@@ -279,7 +279,23 @@ class Joystick(aliengo_base.AliengoEnv):
             "action":      jp.zeros(self.mjx_model.nu),
             "qpos":        jp.zeros(self.mjx_model.nq),
         },
+        "reward_terms" : {}
     }
+
+    dummy_rewards = self._get_reward(
+        data,
+        jp.zeros(self.mjx_model.nu),
+        info,
+        jp.array(False),
+        jp.array(False),
+        jp.zeros(len(self._feet_geom_id), dtype=bool),
+    )
+
+    dummy_rewards = {
+        k: v * self._config.reward_config.scales[k] for k, v in dummy_rewards.items()
+    }
+
+    info["reward_terms"] = dummy_rewards
 
     metrics = {}
     for k in self._config.reward_config.scales.keys():
@@ -440,6 +456,8 @@ class Joystick(aliengo_base.AliengoEnv):
     }
     reward = jp.clip(sum(rewards.values()) * self.dt, 0.0, 10000.0)
 
+    state.info["reward_terms"] = rewards
+    
     state.info["last_last_act"] = state.info["last_act"]
     state.info["last_act"] = action
     state.info["steps_until_next_cmd"] -= 1

@@ -153,14 +153,14 @@
   </worldbody>
 
   <actuator>
-    <motor name="joint_left_leg_1_ctrl" joint="joint_left_leg_1" class="joint_1" />
-    <motor name="joint_left_leg_2_ctrl" joint="joint_left_leg_2" class="joint_2" />
-    <motor name="joint_left_leg_3_ctrl" joint="joint_left_leg_3" class="joint_3" />
-    <motor name="joint_left_leg_4_ctrl" joint="joint_left_leg_4" class="joint_4" />
-    <motor name="joint_right_leg_1_ctrl" joint="joint_right_leg_1" class="joint_1" />
-    <motor name="joint_right_leg_2_ctrl" joint="joint_right_leg_2" class="joint_2" />
-    <motor name="joint_right_leg_3_ctrl" joint="joint_right_leg_3" class="joint_3" />
-    <motor name="joint_right_leg_4_ctrl" joint="joint_right_leg_4" class="joint_4" />
+    <position name="joint_left_leg_1_ctrl" joint="joint_left_leg_1" class="joint_1" />
+    <position name="joint_left_leg_2_ctrl" joint="joint_left_leg_2" class="joint_2" />
+    <position name="joint_left_leg_3_ctrl" joint="joint_left_leg_3" class="joint_3" />
+    <velocity name="joint_left_leg_4_ctrl" joint="joint_left_leg_4" class="joint_4" />
+    <position name="joint_right_leg_1_ctrl" joint="joint_right_leg_1" class="joint_1" />
+    <position name="joint_right_leg_2_ctrl" joint="joint_right_leg_2" class="joint_2" />
+    <position name="joint_right_leg_3_ctrl" joint="joint_right_leg_3" class="joint_3" />
+    <velocity name="joint_right_leg_4_ctrl" joint="joint_right_leg_4" class="joint_4" />
   </actuator>
 
   <contact>
