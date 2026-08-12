@@ -59,7 +59,7 @@ def default_config() -> config_dict.ConfigDict:
       ctrl_dt=0.01,
       sim_dt=0.002,
       episode_length=1000,
-      Kp=35.0,
+      Kp=50.0,
       Kd=1.0,
       Kd_wheel=0.5,      # kv delle ruote (velocity control)
       action_repeat=1,
@@ -68,7 +68,7 @@ def default_config() -> config_dict.ConfigDict:
       # DDT Isaac Gym reference (2.5*a - 0.5*w). Was 30.0, which gave 15*a - 0.5*w:
       # 6x the reference feedforward, i.e. a unit action produced ~3-4x the corrective
       # torque a moderate lean needs (~4 N*m/wheel at 0.1 rad) -> over-twitchy wheels.
-      action_scale_vel=5.0,
+      action_scale_vel=25.0,
       soft_joint_pos_limit_factor=0.95, 
       noise_config=config_dict.create(
           level=0.0,
@@ -82,7 +82,7 @@ def default_config() -> config_dict.ConfigDict:
       ),
       reward_config=config_dict.create(
           scales=config_dict.create(
-              tracking_lin_vel=1.0,
+              tracking_lin_vel=2.0,
               tracking_ang_vel=0.5,
               orientation=-2.0,
               ang_vel_xy=-0.3,
@@ -106,8 +106,8 @@ def default_config() -> config_dict.ConfigDict:
       ),
       # Command = [forward_vel (m/s), yaw_rate (rad/s)].
       command_config=config_dict.create(
-          a=[0.0, 0.0],     # amplitude (uniform half-range) per command
-          b=[0.75, 0.5],    # prob a resampled command stays non-zero
+          a=[1.0, 0.5],     # amplitude (uniform half-range) per command
+          b=[0.75, 0.75],    # prob a resampled command stays non-zero
           p_stand=0.2,      # prob of an explicit zero (standing) command
       ),
       impl="jax",
