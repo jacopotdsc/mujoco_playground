@@ -57,18 +57,6 @@ class TitaEnv(mjx_env.MjxEnv):
     # Modify PD gains.
     leg = jp.array(consts.LEG_DOF_IDS)      # es. [0,1,2,4,5,6]
     wheel = jp.array(consts.WHEEL_DOF_IDS)  # es. [3,7]
-    # --- gambe: position PD  force = kp*(ctrl-q) - kv*dq ---
-    self._mj_model.actuator_gainprm[leg, 0] =  config.Kp        # 35
-    self._mj_model.actuator_biasprm[leg, 1] = -config.Kp        # -35
-    self._mj_model.actuator_biasprm[leg, 2] = -config.Kd        # -10
-
-    # --- ruote: velocity  →  force = Kd_wheel*(ctrl-dq) ---
-    self._mj_model.actuator_gainprm[wheel, 0] =  config.Kd_wheel   # 0.5
-    self._mj_model.actuator_biasprm[wheel, 1] =  0.0               # niente feedback su q
-    self._mj_model.actuator_biasprm[wheel, 2] = -config.Kd_wheel   # -0.5
-
-    # gainprm ha anche componenti [1],[2]: azzerale per sicurezza sui gain
-    self._mj_model.actuator_gainprm[:, 1:3] = 0.0
 
     # Increase offscreen framebuffer size to render at higher resolutions.
     self._mj_model.vis.global_.offwidth = 3840

@@ -106,7 +106,7 @@ def default_config() -> config_dict.ConfigDict:
       ),
       # Command = [forward_vel (m/s), yaw_rate (rad/s)].
       command_config=config_dict.create(
-          a=[1.0, 0.5],     # amplitude (uniform half-range) per command
+          a=[2.0, 1.0],     # amplitude (uniform half-range) per command
           b=[0.75, 0.75],    # prob a resampled command stays non-zero
           p_stand=0.2,      # prob of an explicit zero (standing) command
       ),
@@ -214,7 +214,6 @@ class Joystick(tita_base.TitaEnv):
     #qvel = qvel.at[0:2].set(jp.concatenate([vx, vy]))
 
     ctrl = jp.zeros(self.mjx_model.nu)
-    ctrl = ctrl.at[self._leg_ids].set(qpos[7:][self._leg_ids])
 
     data = mjx_env.make_data(
         self.mj_model,
@@ -262,7 +261,8 @@ class Joystick(tita_base.TitaEnv):
     info = {
         "rng": rng,
         "step": 0,
-        "command": cmd,
+        "command": jp.zeros_like(cmd),
+        "target_command" : cmd,
         "steps_until_next_cmd": steps_until_next_cmd,
         "last_act": jp.zeros(self.mjx_model.nu),
         "last_last_act": jp.zeros(self.mjx_model.nu),
@@ -330,14 +330,18 @@ class Joystick(tita_base.TitaEnv):
     if self._config.pert_config.enable:
       state = self._maybe_apply_perturbation(state)
 
-    ctrl = jp.zeros(self.mjx_model.nu)
-    ctrl = ctrl.at[self._leg_ids].set(
-        self._default_pose[self._leg_ids]
-        + action[self._leg_ids] * self._config.action_scale_pos
-    )
-    ctrl = ctrl.at[self._wheel_ids].set(
-        action[self._wheel_ids] * self._config.action_scale_vel
-    )
+    q = state.data.qpos[7:]
+    qd = state.data.qvel[6:]
+
+    q_des = self._default_pose + action * self._config.action_scale_pos
+    tau_leg = self._config.Kp * (q_des - q) - self._config.Kd * qd
+    tau_leg = jp.array(tau_leg).at[self._wheel_ids].set(0.0)
+
+    v_des = action* self._config.action_scale_vel
+    tau_wheel = self._config.Kd_wheel * (v_des - qd)
+    tau_wheel = jp.array(tau_wheel).at[self._leg_ids].set(0.0)
+
+    ctrl = tau_leg + tau_wheel
 
     data = mjx_env.step(self.mjx_model, state.data, ctrl, self.n_substeps)
     state = state.replace(data=data)
@@ -406,6 +410,8 @@ class Joystick(tita_base.TitaEnv):
 
     state.info["reward_terms"] = rewards
 
+    for k, v in rewards.items():
+      state.metrics[f"reward/{k}"] = v
 
     # Aggiorna i buffer (equivalente della coda di post_physics_step).
     state.info["step"] += 1
@@ -419,19 +425,20 @@ class Joystick(tita_base.TitaEnv):
     # Ricampionamento comandi a intervallo fisso (Isaac: resampling_time).
     state.info["steps_until_next_cmd"] -= 1
     state.info["rng"], key1, key2 = jax.random.split(state.info["rng"], 3)
-    state.info["command"] = jp.where(
+    state.info["target_command"] = jp.where(
         state.info["steps_until_next_cmd"] <= 0,
-        self.sample_command(key1, state.info["command"]),
-        state.info["command"],
+        self.sample_command(key1, state.info["target_command"]),
+        state.info["target_command"],
+    )
+    state.info["command"] = (
+        state.info["command"]
+        + 0.02 * (state.info["target_command"] - state.info["command"])
     )
     state.info["steps_until_next_cmd"] = jp.where(
-        done | (state.info["steps_until_next_cmd"] <= 0),
+        (state.info["steps_until_next_cmd"] <= 0),
         jp.round(jax.random.exponential(key2) * 5.0 / self.dt).astype(jp.int32),
         state.info["steps_until_next_cmd"],
     )
-
-    for k, v in rewards.items():
-      state.metrics[f"reward/{k}"] = v
 
     done = done.astype(reward.dtype)
     state = state.replace(data=data, obs=obs, reward=reward, done=done)
