@@ -59,7 +59,7 @@ def default_config() -> config_dict.ConfigDict:
       ctrl_dt=0.01,
       sim_dt=0.002,
       episode_length=1000,
-      Kp=50.0,
+      Kp=40.0,
       Kd=1.0,
       Kd_wheel=0.5,      # kv delle ruote (velocity control)
       action_repeat=1,
@@ -89,8 +89,9 @@ def default_config() -> config_dict.ConfigDict:
               base_height=-1.0,
               posture=-5.0,      # command-gated; see _cost_posture
               torques=-1e-4,
-              action_rate=-0.01,
+              action_rate=-0.5,
               dof_pos_limits=-1.0,
+              dof_vel=-0.1,
               termination=-5.0,
           ),
           only_positive_rewards=False,
@@ -587,6 +588,7 @@ class Joystick(tita_base.TitaEnv):
         "torques": self._cost_torques(data.actuator_force),
         "action_rate": self._cost_action_rate(action, info["last_act"]),
         "dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
+        "dof_vel": self._cost_dof_vel(data.qvel[6:], command),
         "termination": self._cost_termination(done),
     }
 
@@ -646,6 +648,13 @@ class Joystick(tita_base.TitaEnv):
     out = -jp.clip(q - self._soft_lowers, None, 0.0)
     out += jp.clip(q - self._soft_uppers, 0.0, None)
     return jp.sum(out)
+
+  def _cost_dof_vel(self, qvel: jax.Array, command: jax.Array) -> jax.Array:
+    leg_qvel = qvel[jp.array(consts.LEG_DOF_IDS)]     # 6 leg DOF, excludes wheels
+    raw  = jp.sum(jp.square(leg_qvel))
+    gate = jp.exp(-jp.sum(jp.square(command))
+                  / 0.25 )#self._config.reward_config.dof_vel_cmd_sigma)
+    return raw #* gate
 
   def _cost_termination(self, done: jax.Array) -> jax.Array:
     return done
