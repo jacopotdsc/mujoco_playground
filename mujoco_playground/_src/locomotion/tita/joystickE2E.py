@@ -106,8 +106,9 @@ def default_config() -> config_dict.ConfigDict:
       ),
       # Command = [forward_vel (m/s), yaw_rate (rad/s)].
       command_config=config_dict.create(
-          a=[2.0, 1.0],     # amplitude (uniform half-range) per command
+          a=[1.0, 0.5],     # amplitude (uniform half-range) per command
           b=[0.75, 0.75],    # prob a resampled command stays non-zero
+          h=[0.4, 0.4],    # CoM height command range [min, max] [m]
           p_stand=0.2,      # prob of an explicit zero (standing) command
       ),
       impl="jax",
@@ -180,6 +181,7 @@ class Joystick(tita_base.TitaEnv):
 
     self._cmd_a = jp.array(self._config.command_config.a)
     self._cmd_b = jp.array(self._config.command_config.b)
+    self._cmd_h = jp.array(self._config.command_config.h)
 
     # Posture weights over the 6 leg joints [hip, thigh, knee] x 2.
     # The hip (leg_1) is the "spread" DOF (d(track)/d(hip) ~ 0.35 m/rad), so it
@@ -258,10 +260,14 @@ class Joystick(tita_base.TitaEnv):
         key2, shape=(self._cmd_a.shape[0],), minval=-self._cmd_a, maxval=self._cmd_a
     )
 
+    _, height_rng = jax.random.split(rng)
+    base_height_target = self.sample_height(height_rng)
+
     info = {
         "rng": rng,
         "step": 0,
         "command": jp.zeros_like(cmd),
+        "base_height_target": base_height_target,
         "target_command" : cmd,
         "steps_until_next_cmd": steps_until_next_cmd,
         "last_act": jp.zeros(self.mjx_model.nu),
@@ -283,7 +289,6 @@ class Joystick(tita_base.TitaEnv):
             "qpos": data.qpos,
             "qvel": data.qvel,
             "com_height": data.sensordata[self._base_com_adr][2],
-            "base_height_target": self._config.reward_config.base_height_target,
             "local_linvel": self.get_local_linvel(data),
             "gyro": self.get_gyro(data),
             "global_linvel": self.get_global_linvel(data),
@@ -330,20 +335,25 @@ class Joystick(tita_base.TitaEnv):
     if self._config.pert_config.enable:
       state = self._maybe_apply_perturbation(state)
 
-    q = state.data.qpos[7:]
-    qd = state.data.qvel[6:]
-
     q_des = self._default_pose + action * self._config.action_scale_pos
-    tau_leg = self._config.Kp * (q_des - q) - self._config.Kd * qd
-    tau_leg = jp.array(tau_leg).at[self._wheel_ids].set(0.0)
+    v_des = action * self._config.action_scale_vel
 
-    v_des = action* self._config.action_scale_vel
-    tau_wheel = self._config.Kd_wheel * (v_des - qd)
-    tau_wheel = jp.array(tau_wheel).at[self._leg_ids].set(0.0)
+    def substep_fn(data, _):
+        q  = data.qpos[7:]
+        qd = data.qvel[6:]
 
-    ctrl = tau_leg + tau_wheel
+        tau_leg   = self._config.Kp * (q_des - q) - self._config.Kd * qd
+        tau_wheel = self._config.Kd_wheel * (v_des - qd)
 
-    data = mjx_env.step(self.mjx_model, state.data, ctrl, self.n_substeps)
+        ctrl = jp.zeros(self.mjx_model.nu)
+        ctrl = ctrl.at[self._leg_ids].set(tau_leg[self._leg_ids])
+        ctrl = ctrl.at[self._wheel_ids].set(tau_wheel[self._wheel_ids])
+
+        data = data.replace(ctrl=ctrl)
+        data = mjx.step(self.mjx_model, data)
+        return data, None
+
+    data, _ = jax.lax.scan(substep_fn, state.data, xs=None, length=self.n_substeps)
     state = state.replace(data=data)
 
     # Foot contact bookkeeping (kept for eval/plotting).
@@ -372,7 +382,6 @@ class Joystick(tita_base.TitaEnv):
         "qpos": data.qpos,
         "qvel": data.qvel,
         "com_height": data.sensordata[self._base_com_adr][2],
-        "base_height_target": self._config.reward_config.base_height_target,
         "local_linvel": self.get_local_linvel(data),
         "gyro": self.get_gyro(data),
         "global_linvel": self.get_global_linvel(data),
@@ -514,7 +523,7 @@ class Joystick(tita_base.TitaEnv):
     # cannot close a loop on CoM_z and slowly sinks. Centred near 0 so the running
     # obs-normalizer behaves. Same CoM sensor used by the height reward.
     current_com_height = data.sensordata[self._base_com_adr][2]
-    com_height_err = (current_com_height - self._config.reward_config.base_height_target)
+    com_height_err = (current_com_height - info["base_height_target"])
     state = jp.hstack([
         noisy_linvel,        # 3   local linear velocity
         noisy_gyro,          # 3   body angular velocity
@@ -523,7 +532,7 @@ class Joystick(tita_base.TitaEnv):
         noisy_joint_vel,     # 8   all joint velocities (incl. wheels)
         action,              # 8   previous action
         info["command"],     # 2   [forward_vel, yaw_rate]
-        current_com_height, #com_height_err[None], # 1  CoM height error (com_z - target)
+        com_height_err, # 1  CoM height error (com_z - target)
     ])  # total: 34
 
     accelerometer = self.get_accelerometer(data)
@@ -572,7 +581,7 @@ class Joystick(tita_base.TitaEnv):
         # Balance / body configuration.
         "orientation": self._cost_orientation(data),
         "ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
-        "base_height": self._cost_height(body_height),
+        "base_height": self._cost_height(body_height, info["base_height_target"]),
         "posture": self._cost_posture(data.qpos[7:], command),
         # Effort / smoothness / safety.
         "torques": self._cost_torques(data.actuator_force),
@@ -600,7 +609,7 @@ class Joystick(tita_base.TitaEnv):
   def _cost_ang_vel_xy(self, global_angvel: jax.Array) -> jax.Array:
     return jp.sum(jp.square(global_angvel[:2]))
 
-  def _cost_height(self, body_height: jax.Array) -> jax.Array:
+  def _cost_height(self, body_height, base_height_target: jax.Array) -> jax.Array:
     # Smooth, bounded cost with a NON-ZERO gradient right at the target. The old
     # version had a +/-2 cm deadzone (zero gradient in [0.38,0.42]) which let the CoM
     # sink ~2 cm for free before any penalty appeared -> no restoring signal at the
@@ -608,7 +617,7 @@ class Joystick(tita_base.TitaEnv):
     # holding exactly 0.40 is strictly better than sinking. Still saturates (->1) so a
     # large error can never dominate / explode.
     #   err(m):  0.00 ->0.00 | 0.02 ->0.148 | 0.05 ->0.632 | 0.10 ->0.982
-    err = body_height - self._config.reward_config.base_height_target
+    err = body_height - base_height_target
     return 1.0 - jp.exp(-jp.square(err / 0.05))
 
   def _cost_posture(self, qpos: jax.Array, command: jax.Array) -> jax.Array:
@@ -655,6 +664,14 @@ class Joystick(tita_base.TitaEnv):
     w_k = jax.random.bernoulli(w_rng, 0.5, shape=(cmd_shape,))
     x_kp1 = x_k - w_k * (x_k - y_k * z_k)
     return x_kp1
+
+  def sample_height(self, rng: jax.Array) -> jax.Array:
+    return jax.random.uniform(
+        rng,
+        shape=(),
+        minval=self._cmd_h[0],
+        maxval=self._cmd_h[1],
+    )
 
   def _maybe_apply_perturbation(self, state: mjx_env.State) -> mjx_env.State:
     def gen_dir(rng: jax.Array) -> jax.Array:
