@@ -4,25 +4,6 @@
 #   qpos[7:] index -> 0,1,2 = left  hip/thigh/knee, 3 = left  wheel
 #                     4,5,6 = right hip/thigh/knee, 7 = right wheel
 #   LEG_DOF_IDS = [0,1,2,4,5,6]   WHEEL_DOF_IDS = [3,7]
-#
-# Control (MuJoCo actuators, gains overridden in tita/base.py; applied every sim
-# substep at 500 Hz, ctrl held constant across the 5 substeps of one policy step):
-#   legs   (<position> actuator): tau = 35*(q_target - q) - 10*qdot   (Kp=35, Kd=10)
-#   wheels (<velocity> actuator): tau = 0.5*(v_target - qdot)         (Kd_wheel=0.5)
-#   torque saturation +-120 N*m (forcerange in tita.xml)
-#
-# NOTE on the wheel law: with v_target = action_scale_vel*a the <velocity> actuator
-# executes  tau = 0.5*(action_scale_vel*a - qdot) = (0.5*action_scale_vel)*a - 0.5*qdot,
-# i.e. a DAMPED TORQUE COMMAND (feedforward torque proportional to action + velocity
-# damping) - NOT a stiff velocity lock. This is the same structure as the DDT Isaac
-# Gym reference wheel law  tau = 2.5*a - 0.5*qdot. Matching it exactly needs
-# action_scale_vel = 5.0  (-> 2.5*a - 0.5*qdot).
-#
-# Action -> command:
-#   legs:   q_target = default_pose + action * action_scale_pos    (+-0.5 rad)
-#   wheels: v_target = action        * action_scale_vel            (5 rad/s -> feedforward 2.5*a)
-#
-# Timing: sim_dt = 0.002, ctrl_dt = 0.01  ->  5 substeps, 100 Hz policy.
 """Joystick task for TITA."""
 
 from typing import Any, Dict, Optional, Tuple, Union
@@ -59,7 +40,7 @@ def default_config() -> config_dict.ConfigDict:
       ctrl_dt=0.01,
       sim_dt=0.002,
       episode_length=1000,
-      Kp=40.0,
+      Kp=50.0,
       Kd=1.0,
       Kd_wheel=0.5,      # kv delle ruote (velocity control)
       action_repeat=1,
@@ -82,20 +63,20 @@ def default_config() -> config_dict.ConfigDict:
       ),
       reward_config=config_dict.create(
           scales=config_dict.create(
-              tracking_lin_vel=2.0,
+              tracking_lin_vel=1.0,
               tracking_ang_vel=0.5,
-              orientation=-2.0,
+              orientation=-1.0,
               ang_vel_xy=-0.3,
               base_height=-1.0,
-              posture=-5.0,      # command-gated; see _cost_posture
+              posture=-1.0,      # command-gated; see _cost_posture
               torques=-1e-4,
-              action_rate=-0.5,
+              action_rate=-0.01,
               dof_pos_limits=-1.0,
-              dof_vel=-0.1,
-              termination=-5.0,
+              dof_vel=-0.0,
+              termination=-100.0,
           ),
           only_positive_rewards=False,
-          tracking_sigma=0.25,
+          tracking_sigma=0.0625,
           base_height_target=0.4,   # task target; home-pose COM is ~0.3956 (inside the 2 cm deadzone)
           posture_cmd_sigma=0.25,     # gate width: posture relaxes as |command| grows
       ),
@@ -612,13 +593,6 @@ class Joystick(tita_base.TitaEnv):
     return jp.sum(jp.square(global_angvel[:2]))
 
   def _cost_height(self, body_height, base_height_target: jax.Array) -> jax.Array:
-    # Smooth, bounded cost with a NON-ZERO gradient right at the target. The old
-    # version had a +/-2 cm deadzone (zero gradient in [0.38,0.42]) which let the CoM
-    # sink ~2 cm for free before any penalty appeared -> no restoring signal at the
-    # equilibrium. No deadzone now: the slope is non-zero from 0.40 downward, so
-    # holding exactly 0.40 is strictly better than sinking. Still saturates (->1) so a
-    # large error can never dominate / explode.
-    #   err(m):  0.00 ->0.00 | 0.02 ->0.148 | 0.05 ->0.632 | 0.10 ->0.982
     err = body_height - base_height_target
     return 1.0 - jp.exp(-jp.square(err / 0.05))
 
