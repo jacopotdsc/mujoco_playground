@@ -1,20 +1,12 @@
-# Copyright 2025 DeepMind Technologies Limited
+# Joystick task for TITA (two-wheeled balancing biped) on MuJoCo Playground / MJX.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Joystick task for Tita."""
+# The robot has two 3-DOF legs, each ending in a driven wheel:
+#   qpos[7:] index -> 0,1,2 = left  hip/thigh/knee, 3 = left  wheel
+#                     4,5,6 = right hip/thigh/knee, 7 = right wheel
+#   LEG_DOF_IDS = [0,1,2,4,5,6]   WHEEL_DOF_IDS = [3,7]
+"""Joystick task for TITA."""
 
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jp
@@ -31,61 +23,57 @@ from mpx.utils.mpc_wrapper_dfcip import BatchedMPCControllerWrapper
 import mpx.utils.sim as sim_utils
 import mpx.utils.mpc_utils as mpc_utils
 
-# Copyright 2025 DeepMind Technologies Limited
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Utilities for extracting collision information."""
 
-from typing import Any, Tuple
-
-import jax
-import jax.numpy as jnp
-from mujoco import mjx
+def _tree_has_nonfinite(tree) -> jax.Array:
+  """True if any float leaf of the pytree contains NaN/Inf."""
+  leaves = jax.tree_util.tree_leaves(tree)
+  checks = [
+      jp.any(~jp.isfinite(x))
+      for x in leaves
+      if jp.issubdtype(jp.asarray(x).dtype, jp.floating)
+  ]
+  if not checks:
+    return jp.array(False)
+  return jp.stack(checks).any()
 
 
 def get_collision_info(
     contact: Any, geom1: int, geom2: int
 ) -> Tuple[jax.Array, jax.Array]:
-  """Get the distance and normal of the collision between two geoms."""
-  mask = (jnp.array([geom1, geom2]) == contact.geom).all(axis=1)
-  mask |= (jnp.array([geom2, geom1]) == contact.geom).all(axis=1)
-  idx = jnp.where(mask, contact.dist, 1e4).argmin()
+  """Distance and normal of the (geom1, geom2) contact, if any."""
+  mask = (jp.array([geom1, geom2]) == contact.geom).all(axis=1)
+  mask |= (jp.array([geom2, geom1]) == contact.geom).all(axis=1)
+  idx = jp.where(mask, contact.dist, 1e4).argmin()
   dist = contact.dist[idx] * mask[idx]
   normal = (dist < 0) * contact.frame[idx, 0, :3]
   return dist, normal
 
 
 def geoms_colliding(state: mjx.Data, geom1: int, geom2: int) -> jax.Array:
-  """Return True if the two geoms are colliding."""
+  """True if the two geoms are colliding."""
   return get_collision_info(state._impl.contact, geom1, geom2)[0] < 0  # pylint: disable=protected-access
+
 
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
-      ctrl_dt=0.01,#2,
+      ctrl_dt=0.01,
       sim_dt=0.002,
       episode_length=1000,
-      Kp=35.0,
-      Kd=10.0,
-      Kd_wheel=0.5,
+      Kp=50.0,
+      Kd=1.0,
+      Kd_wheel=0.5,      # kv delle ruote (velocity control)
       action_repeat=1,
-      action_scale=1.0,
-      history_len=1,
-      soft_joint_pos_limit_factor=0.95,
+      action_scale_pos=0.5,
+      # 5.0 -> executed wheel law tau = 0.5*(5*a - w) = 2.5*a - 0.5*w, IDENTICAL to the
+      # DDT Isaac Gym reference (2.5*a - 0.5*w). Was 30.0, which gave 15*a - 0.5*w:
+      # 6x the reference feedforward, i.e. a unit action produced ~3-4x the corrective
+      # torque a moderate lean needs (~4 N*m/wheel at 0.1 rad) -> over-twitchy wheels.
+      action_scale_vel=25.0,
+      soft_joint_pos_limit_factor=0.95, 
       noise_config=config_dict.create(
-          level=1.0,  # Set to 0.0 to disable noise.
+          level=0.0,
           scales=config_dict.create(
-              joint_pos=0.03,
+              joint_pos=0.01,
               joint_vel=1.5,
               gyro=0.2,
               gravity=0.05,
@@ -94,33 +82,22 @@ def default_config() -> config_dict.ConfigDict:
       ),
       reward_config=config_dict.create(
           scales=config_dict.create(
-              tracking_lin_vel=10.0, 
-              tracking_ang_vel=5.0, 
-              virtual_unicycle_lin=0.0,
-              virtual_unicycle_ang=0.0,
-              action_rate_first_order=-0.000,
-              action_rate_second_order=-0.0000,
-              torques=-0.0001,
-              orientation=1.0,
-              base_height=-50.0,
-              joint_regularization=-1.0,
+              tracking_lin_vel=1.0,
+              tracking_ang_vel=0.5,
+              orientation=-1.0,
+              ang_vel_xy=-0.3,
+              base_height=-1.0,
+              posture=-1.0,      # command-gated; see _cost_posture
+              torques=-1e-4,
+              action_rate=-0.01,
+              dof_pos_limits=-1.0,
+              dof_vel=-0.0,
               termination=-100.0,
-
-              lin_vel_z=0.0,
-              ang_vel_xy=0.0,
-              dof_pos_limits=-0.0,
-              energy=-0.0001,
-              wheel_track=-1.0,
-              # Feet.
-              #feet_clearance=-2.0,
-              #feet_height=-0.2,
-              #feet_slip=-0.1,
-              #feet_air_time=0.1,
           ),
-          tracking_sigma=0.25,
-          max_foot_height=0.1,
-          base_height_target=0.40,
-          wheel_track_target=0.567,  # nominal distance between the two wheels (m), same as MPC's config.d
+          only_positive_rewards=False,
+          tracking_sigma=0.0625,
+          base_height_target=0.4,   # task target; home-pose COM is ~0.3956 (inside the 2 cm deadzone)
+          posture_cmd_sigma=0.25,     # gate width: posture relaxes as |command| grows
       ),
       pert_config=config_dict.create(
           enable=False,
@@ -128,11 +105,12 @@ def default_config() -> config_dict.ConfigDict:
           kick_durations=[0.05, 0.2],
           kick_wait_times=[1.0, 3.0],
       ),
+      # Command = [forward_vel (m/s), yaw_rate (rad/s)].
       command_config=config_dict.create(
-          # Uniform distribution for command amplitude.
-          a=[0.0, 0.0, 0.0],
-          # Probability of not zeroing out new command.
-          b=[0.9, 0.25, 0.5],
+          a=[1.0, 0.5],     # amplitude (uniform half-range) per command
+          b=[0.75, 0.75],    # prob a resampled command stays non-zero
+          h=[0.4, 0.4],    # CoM height command range [min, max] [m]
+          p_stand=0.2,      # prob of an explicit zero (standing) command
       ),
       impl="jax",
       naconmax=4 * 8192,
@@ -141,7 +119,7 @@ def default_config() -> config_dict.ConfigDict:
 
 
 class Joystick(tita_base.TitaEnv):
-  """Track a joystick command for the Tita Wheel-Legged Robot."""
+  """Track a joystick command with the TITA wheeled biped."""
 
   def __init__(
       self,
@@ -149,9 +127,6 @@ class Joystick(tita_base.TitaEnv):
       config: config_dict.ConfigDict = default_config(),
       config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
   ):
-    if task.startswith("rough") or task in ("stairs_terrain", "perlin_terrain"):
-      config.naconmax = 8 * 8192
-      config.njmax = 12 + 48
     super().__init__(
         xml_path=consts.task_to_xml(task).as_posix(),
         config=config,
@@ -161,46 +136,62 @@ class Joystick(tita_base.TitaEnv):
 
   def _post_init(self) -> None:
     self._init_q = jp.array(self._mj_model.keyframe("home").qpos)
+    # The "home" keyframe spawns the base at z=0.44, which puts each wheel bottom at
+    # -0.0035 m (3.5 mm below the floor) -> a contact impulse on every reset. Lift the
+    # base by 3.5 mm so the wheels just touch. (Pose/COM unchanged: COM ~0.3956 m, still
+    # inside the 2 cm height-reward deadzone around the 0.4 target.)
+    self._init_q = self._init_q.at[2].set(0.4435)
     self._default_pose = jp.array(self._mj_model.keyframe("home").qpos[7:])
 
-    # Limit DOFs, exclude body and wheels. First joint is freejoint.
-    jnt_range_reduced = jp.delete(self.mj_model.jnt_range, jp.array([0, 4, 8]), axis=0)
+    self._leg_ids = jp.array(consts.LEG_DOF_IDS)
+    self._wheel_ids = jp.array(consts.WHEEL_DOF_IDS)
 
-    self._lowers, self._uppers = jnt_range_reduced.T
-    c = (self._lowers + self._uppers) / 2
-    r = self._uppers - self._lowers
-    self._soft_lowers = c - 0.5 * r * self._config.soft_joint_pos_limit_factor
-    self._soft_uppers = c + 0.5 * r * self._config.soft_joint_pos_limit_factor
+    # Soft joint limits (legs only; wheels are continuous).
+    self._lowers, self._uppers = self.mj_model.jnt_range[1:].T
+    f = self._config.soft_joint_pos_limit_factor
+    self._soft_lowers = self._lowers[self._leg_ids] * f
+    self._soft_uppers = self._uppers[self._leg_ids] * f
+    self._torque_limits = jp.array(self.mj_model.actuator_forcerange[:, 1])
 
-    # Setup Indices and IDs
     self._torso_body_id = self._mj_model.body(consts.ROOT_BODY).id
     self._torso_mass = self._mj_model.body_subtreemass[self._torso_body_id]
 
     self._feet_site_id = jp.array(
         [self._mj_model.site(name).id for name in consts.FEET_SITES]
     )
-    self._floor_geom_id = self._mj_model.geom("floor").id
+    self._floor_geom_id = self._mj_model.geom(consts.FLOOR_GEOM).id
     self._feet_geom_id = jp.array(
         [self._mj_model.geom(name).id for name in consts.FEET_GEOMS]
     )
-
-    self._torso_body_id = self._mj_model.body(consts.ROOT_BODY).id
+    self._termination_geom_id = jp.array(
+        [self._mj_model.geom(name).id for name in consts.TERMINATION_GEOMS]
+    )
+    self._collision_geom_id = jp.array(
+        [self._mj_model.geom(name).id for name in consts.COLLISION_GEOMS]
+    )
 
     foot_linvel_sensor_adr = []
     for site in consts.FEET_SITES:
       sensor_id = self._mj_model.sensor(f"{site}_global_linvel").id
-      sensor_adr = self._mj_model.sensor_adr[sensor_id]
-      sensor_dim = self._mj_model.sensor_dim[sensor_id]
-      foot_linvel_sensor_adr.append(
-          list(range(sensor_adr, sensor_adr + sensor_dim))
-      )
+      adr = self._mj_model.sensor_adr[sensor_id]
+      dim = self._mj_model.sensor_dim[sensor_id]
+      foot_linvel_sensor_adr.append(list(range(adr, adr + dim)))
     self._foot_linvel_sensor_adr = jp.array(foot_linvel_sensor_adr)
+
     self._base_com_adr = self._sensor_adr("base_subtree_com")
-    self._base_com_linvel_adr = self._sensor_adr("base_subtree_linvel")
 
     self._cmd_a = jp.array(self._config.command_config.a)
     self._cmd_b = jp.array(self._config.command_config.b)
+    self._cmd_h = jp.array(self._config.command_config.h)
 
+    # Posture weights over the 6 leg joints [hip, thigh, knee] x 2.
+    # The hip (leg_1) is the "spread" DOF (d(track)/d(hip) ~ 0.35 m/rad), so it
+    # gets the highest weight.
+    self._posture_weights = jp.array([1.0, 0.5, 0.5, 1.0, 0.5, 0.5])
+
+    self._base_com_linvel_adr = self._sensor_adr("base_subtree_linvel")
+
+    # Batched MPC/WBC wrapper (batch size 1), same construction as the MPC env.
     sim_frequency = 1.0 / self.sim_dt
     self.mpc_period = max(1, int(sim_frequency / config.mpc_frequency))
     self.mpc = BatchedMPCControllerWrapper(config, 1)
@@ -275,38 +266,58 @@ class Joystick(tita_base.TitaEnv):
         jp.array([w]),
     ])
     return x0, theta
-   
 
+  def _joint_targets_from_qddot(self, qpos_joint, qvel_joint, qddot):
+    """Desired joint pos/vel = current state integrated forward with the WBC's
+    solved joint accelerations. qddot is (1, nv) from the vmapped solver
+    (batch dim kept, unlike mpc_tau): [:, :6] is the floating base, [:, 6:] the
+    nj actuated joints in qpos[7:]/qvel[6:] order."""
+    dt = self._config.sim_dt
+    qddot_joint = qddot[0, 6:]
+    dq_desired = qvel_joint + qddot_joint * dt
+    q_desired = qpos_joint + qvel_joint * dt + 0.5 * qddot_joint * dt**2
+    joint_pos_des = q_desired[self._leg_ids]
+    wheel_vel_des = dq_desired[self._wheel_ids]
+    return joint_pos_des, wheel_vel_des
+
+  # --------------------------------------------------------------------
+  # Reset / step.
+  # --------------------------------------------------------------------
   def reset(self, rng: jax.Array) -> mjx_env.State:
     qpos = self._init_q
     qvel = jp.zeros(self.mjx_model.nv)
 
-    # Base randomization
+    # x,y = +U(-0.5, 0.5), yaw = U(-pi, pi).
     rng, key = jax.random.split(rng)
     dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
-    #qpos = qpos.at[0:2].set(qpos[0:2] + dxy) 
+    #qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
     rng, key = jax.random.split(rng)
-    yaw = jax.random.uniform(key, (1,), minval=-jp.pi, maxval=jp.pi)
-    quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
-    new_quat = math.quat_mul(qpos[3:7], quat)
-    #qpos = qpos.at[3:7].set(new_quat) 
+    yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
+    quat = math.axis_angle_to_quat(jp.array([0.0, 0.0, 1.0]), yaw)
+    #qpos = qpos.at[3:7].set(math.quat_mul(qpos[3:7], quat))
 
-    # velocity randomization: d(xyzrpy)=U(-0.5, 0.5)
+    # Start under mild planar motion. Ranges kept small for the STATIONARY task:
+    # with the wheels reset to v_des=0, even vx=0.2 m/s pitches the base ~64 deg
+    # in 0.5 s uncontrolled, so a large initial velocity makes every episode start
+    # as a hard recovery instead of standing. Lateral (vy) self-damps via wheel
+    # friction, so it is kept smaller still.
     rng, key = jax.random.split(rng)
-    #qvel = qvel.at[0:6].set(
-    #    jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5)
-    #)
+    vx = jax.random.uniform(key, (1,), minval=-0.2, maxval=0.2)
+    rng, key = jax.random.split(rng)
+    vy = jax.random.uniform(key, (1,), minval=-0.1, maxval=0.1)
+    #qvel = qvel.at[0:2].set(jp.concatenate([vx, vy]))
 
-    data = data = mjx_env.make_data(
+    ctrl = jp.zeros(self.mjx_model.nu)
+
+    data = mjx_env.make_data(
         self.mj_model,
         qpos=qpos,
         qvel=qvel,
-        ctrl=jp.zeros(self.mjx_model.nu),
+        ctrl=ctrl,
         impl=self.mjx_model.impl.value,
         naconmax=self._config.naconmax,
         njmax=self._config.njmax,
     )
-
     data = mjx.forward(self.mjx_model, data)
 
     rng, key1, key2, key3 = jax.random.split(rng, 4)
@@ -338,33 +349,49 @@ class Joystick(tita_base.TitaEnv):
         jp.int32
     )
     cmd = jax.random.uniform(
-        key2, shape=(3,), minval=-self._cmd_a, maxval=self._cmd_a
+        key2, shape=(self._cmd_a.shape[0],), minval=-self._cmd_a, maxval=self._cmd_a
     )
 
+    _, height_rng = jax.random.split(rng)
+    base_height_target = self.sample_height(height_rng)
+
+    # ------------------------------------------------------------------
+    # MPC augmentation: initialise the persistent MPC state and run one
+    # passive pass so all MPC info fields are populated with correct shapes.
+    # The command fed to the MPC starts at zero (matches info["command"]).
+    # ------------------------------------------------------------------
     mpc_state = self.mpc.init_state()
-    mpc_state, tita_state, dfcip_state, tau, qddot, fl, fr, desired, theta_prev = self._run_mpc_wbc(
-        data=data, 
-        qpos=data.qpos, 
-        qvel=data.qvel, 
+    mpc_state, tita_state, dfcip_state, mpc_tau, mpc_qddot, mpc_fl, mpc_fr, desired, theta_prev, mpc_reference = self._run_mpc_wbc(
+        data=data,
+        qpos=data.qpos,
+        qvel=data.qvel,
         command=cmd,
+        base_height_target=base_height_target,
         action=jp.zeros(self.mjx_model.nu),
         mpc_state=mpc_state,
         theta_prev=0.0,
         timestep=0
         )
 
+    joint_pos_des, wheel_vel_des = self._joint_targets_from_qddot(
+        data.qpos[7:], data.qvel[6:], mpc_qddot
+    )
 
     info = {
         "rng": rng,
+        "step": 0,
         "command": jp.zeros_like(cmd),
-        "target_command": cmd,
-        "theta_prev": theta_prev,
+        "base_height_target": base_height_target,
+        "target_command" : cmd,
         "steps_until_next_cmd": steps_until_next_cmd,
-        "last_act": jp.zeros(self.action_size),
-        "last_last_act": jp.zeros(self.action_size),
-        #"feet_air_time": jp.zeros(2),
+        "last_act": jp.zeros(self.mjx_model.nu),
+        "last_last_act": jp.zeros(self.mjx_model.nu),
+        "last_dof_vel": jp.zeros(consts.NUM_DOFS),
+        "feet_air_time": jp.zeros(2),
+        "last_feet_air_time": jp.zeros(2),
         "last_contact": jp.zeros(2, dtype=bool),
-        #"swing_peak": jp.zeros(2),
+        "swing_peak": jp.zeros(2),            # current_max_feet_height
+        "last_max_feet_height": jp.zeros(2),
         "steps_until_next_pert": steps_until_next_pert,
         "pert_duration_seconds": pert_duration_seconds,
         "pert_duration": pert_duration_steps,
@@ -372,33 +399,53 @@ class Joystick(tita_base.TitaEnv):
         "pert_steps": 0,
         "pert_dir": jp.zeros(3),
         "pert_mag": pert_mag,
-        "step_counter": 0,
-        "mpc_state": mpc_state,
-        "mpc_tau": tau,
-        "mpc_qddot": qddot,
-        "dfcip_state": dfcip_state,
-        "low_level_controller": {
-            "tau_ff":      jp.zeros(self.mjx_model.nu),
-            "q_des":       jp.zeros(self.mjx_model.nu),
-            "dq_des":      jp.zeros(self.mjx_model.nu),
-            "qacc_joints": jp.zeros(self.mjx_model.nu),
-            "tau_p":       jp.zeros(self.mjx_model.nu),
-            "tau_d":       jp.zeros(self.mjx_model.nu),
-            "kp":          jp.zeros(()),
-            "kd":          jp.zeros(()),
-            "action_scale": jp.zeros(()),
-            "action":      jp.zeros(self.action_size),
-            "qpos":        jp.zeros(self.mjx_model.nq),
+        "robot": {
+            "qpos": data.qpos,
+            "qvel": data.qvel,
+            "com_height": data.sensordata[self._base_com_adr][2],
+            "local_linvel": self.get_local_linvel(data),
+            "gyro": self.get_gyro(data),
+            "global_linvel": self.get_global_linvel(data),
+            "global_angvel": self.get_global_angvel(data),
+            "gravity": self.get_gravity(data),
+            "upvector": self.get_upvector(data),
+            "accelerometer": self.get_accelerometer(data),
+            "joint_pos": data.qpos[7:],
+            "joint_vel": data.qvel[6:],
+            "actuator_force": data.actuator_force,
+            "ctrl": data.ctrl,
+            "feet_pos": data.site_xpos[self._feet_site_id],
+            "feet_vel": data.sensordata[self._foot_linvel_sensor_adr],
+            "ext_force": data.xfrc_applied[self._torso_body_id, :3],
+            "joint_pos_3d": data.xanchor,
         },
-        "reward_terms": {},
-        "use_only_mpc": False,
+        # --- MPC augmentation: persistent state + logged outputs. ---
+        # These are updated every step() by a passive MPC/WBC pass and never
+        # influence the actuator commands (see step()).
+        "mpc_state": mpc_state,       # persistent MPC/WBC internal state (pytree)
+        "mpc_state_last": mpc_state,  # previous-step MPC/WBC state, for delta obs (0 on reset)
+        "theta_prev": theta_prev,     # unwrapped yaw carried across steps
+        "dfcip_state": dfcip_state,   # DFCIP state x0 (feeds plot_command_tracking)
+        "dfcip_state_last": dfcip_state,  # previous-step DFCIP state, for delta obs (0 on reset)
+        "mpc_tau": mpc_tau,           # WBC feedforward torque (LOGGED ONLY)
+        "mpc_qddot": mpc_qddot,       # WBC joint accelerations (LOGGED ONLY)
+        "mpc_grf_left": mpc_fl,       # left-wheel ground reaction force
+        "mpc_grf_right": mpc_fr,      # right-wheel ground reaction force
+        # MPC control: first-stage optimal control u_ref, from mpc.run()'s reference.
+        "mpc_control": mpc_reference[0][0, 13:],
+        "mpc_control_last": mpc_reference[0][0, 13:],  # previous-step u_ref, for delta obs (0 on reset)
+        # WBC desired vector (com/wheel/base/joint refs); obs slices out q/wheel-vel desired.
+        "mpc_desired": desired[0],
+        "joint_pos_des": joint_pos_des,  # desired leg joint positions (integrated from WBC qddot)
+        "wheel_vel_des": wheel_vel_des,  # desired wheel velocities (integrated from WBC qddot)
+        "reward_terms" : {}
     }
 
     dummy_rewards = self._get_reward(
         data,
         jp.zeros(self.mjx_model.nu),
         info,
-        {},
+        jp.array(False),
         jp.array(False),
         jp.zeros(len(self._feet_geom_id), dtype=bool),
     )
@@ -412,13 +459,12 @@ class Joystick(tita_base.TitaEnv):
     metrics = {}
     for k in self._config.reward_config.scales.keys():
       metrics[f"reward/{k}"] = jp.zeros(())
-    #metrics["swing_peak"] = jp.zeros(())
 
-    obs = self._get_obs(data, info)
+    obs = self._get_obs(data, info, jp.zeros(self.mjx_model.nu))
     reward, done = jp.zeros(2)
     return mjx_env.State(data, obs, reward, done, metrics, info)
-  
-  def _run_mpc_wbc(self, data, qpos: jax.Array, qvel: jax.Array, command: jax.Array, action, mpc_state, theta_prev, timestep: int):
+
+  def _run_mpc_wbc(self, data, qpos: jax.Array, qvel: jax.Array, command: jax.Array, base_height_target, action, mpc_state, theta_prev, timestep: int):
     """Run the MPC planner (called every mpc_period steps)."""
     qpos = jp.nan_to_num(qpos, nan=0.0, posinf=0.0, neginf=0.0)
     qvel = jp.nan_to_num(qvel, nan=0.0, posinf=0.0, neginf=0.0)
@@ -428,7 +474,7 @@ class Joystick(tita_base.TitaEnv):
     tita_state = self.build_tita_state(data)
     x0, theta_prev = self.get_dfip_current_state(tita_state, theta_prev)
 
-    mpc_command = jp.array([command[0], command[1], command[2], 0.4])
+    mpc_command = jp.array([command[0], command[1], command[2], base_height_target])
     mpc_state, reference = self.mpc.run(mpc_state, x0[None, :], mpc_command[None, :])
 
     pl_world_wbc = tita_state[6:9][None, :]
@@ -444,8 +490,8 @@ class Joystick(tita_base.TitaEnv):
     mpc_state, tau, qddot, fl, fr, desired = self.mpc.whole_body_run(
         mpc_state,
         x0,
-        jnp.asarray(qpos)[None, :],
-        jnp.asarray(qvel)[None, :],
+        jp.asarray(qpos)[None, :],
+        jp.asarray(qvel)[None, :],
         pl_world_wbc,
         pr_world_wbc,
         dpl_world_wbc,
@@ -456,43 +502,29 @@ class Joystick(tita_base.TitaEnv):
 
     tau = jp.nan_to_num(tau[0], nan=0.0, posinf=0.0, neginf=0.0)
     qddot = jp.nan_to_num(qddot, nan=0.0, posinf=0.0, neginf=0.0)
-    return mpc_state, tita_state, x0, tau, qddot, fl, fr, desired, theta_prev
+    return mpc_state, tita_state, x0, tau, qddot, fl, fr, desired, theta_prev, reference
 
   def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
     if self._config.pert_config.enable:
       state = self._maybe_apply_perturbation(state)
-    # state = self._reset_if_outside_bounds(state)
-
-    new_mpc_state, tita_state, dfcip_state, new_tau, new_qddot, fl, fr, desired, theta_prev = self._run_mpc_wbc(
-        data=state.data, 
-        qpos=state.data.qpos, 
-        qvel=state.data.qvel, 
+    
+    new_mpc_state, tita_state, dfcip_state, new_tau, new_qddot, mpc_fl, mpc_fr, desired, theta_prev, mpc_reference = self._run_mpc_wbc(
+        data=state.data,
+        qpos=state.data.qpos,
+        qvel=state.data.qvel,
         command=state.info["command"],
+        base_height_target=state.info["base_height_target"],
         action=action,
         mpc_state=state.info["mpc_state"],
         theta_prev=state.info["theta_prev"],
-        timestep=state.info["step_counter"]
-        )
-    
-    def _tree_has_nonfinite(tree) -> jax.Array:
-        """True se una qualsiasi foglia float del pytree contiene NaN/Inf."""
-        leaves = jax.tree_util.tree_leaves(tree)
-        checks = [
-            jp.any(~jp.isfinite(x))
-            for x in leaves
-            if jp.issubdtype(jp.asarray(x).dtype, jp.floating)
-        ]
-        if not checks:
-            return jp.array(False)
-        return jp.stack(checks).any()
-
-
+        timestep=state.info["step"]
+    )
+        
     bad = (
         _tree_has_nonfinite(new_mpc_state)
         | jp.any(~jp.isfinite(new_tau))
         | jp.any(~jp.isfinite(new_qddot))
     )
-
     mpc_state = jax.tree_util.tree_map(
         lambda new, old: jp.where(bad, old, new),
         new_mpc_state,
@@ -501,100 +533,147 @@ class Joystick(tita_base.TitaEnv):
     tau   = jp.where(bad, state.info["mpc_tau"],   new_tau)
     qddot = jp.where(bad, state.info["mpc_qddot"], new_qddot)
 
-    state.info["mpc_state"] = mpc_state
-    state.info["mpc_tau"]   = tau
-    state.info["mpc_qddot"] = qddot
-    state.info["theta_prev"] = theta_prev
-    state.info["dfcip_state"] = dfcip_state
+
+    state.info["dfcip_state_last"] = state.info["dfcip_state"]
+    state.info["mpc_control_last"] = state.info["mpc_control"]
+    state.info["mpc_state_last"] = state.info["mpc_state"]
+
+    state.info["mpc_state"]     = mpc_state
+    state.info["mpc_tau"]       = tau
+    state.info["mpc_qddot"]     = qddot
+    state.info["theta_prev"]    = theta_prev
+    state.info["dfcip_state"]   = dfcip_state
+    state.info["mpc_grf_left"]  = mpc_fl
+    state.info["mpc_grf_right"] = mpc_fr
+    state.info["mpc_control"]   = mpc_reference[0][0, 13:]
+    state.info["mpc_desired"]   = desired[0]
+
+    #q_des = self._default_pose + action * self._config.action_scale_pos
+    #v_des = action * self._config.action_scale_vel
+
+    # Computed here (pre-substep qpos/qvel, same instant as the qddot above),
+    # written to state.info only after the substep loop below.
+    joint_pos_des, wheel_vel_des = self._joint_targets_from_qddot(
+       state.data.qpos[7:], state.data.qvel[6:], qddot
+    )
 
     def substep_fn(data, _):
-        current_qddot = state.info["mpc_qddot"][0, 6:]
-        qpos = data.qpos[7:]
-        qvel = data.qvel[6:]
-        dt = self._config.sim_dt
+        q  = data.qpos[7:]
+        qd = data.qvel[6:]
 
-        #tau_p = self._config.Kp * ( self._default_pose + action*self._config.action_scale - data.qpos[7:])
-        #tau_d = self._config.Kd * ( - data.qvel[6:])
 
-        wheel_idx = jnp.array([3, 7])
-        leg_idx = jnp.array([0, 1, 2, 4, 5, 6])
+        joint_pos_des, wheel_vel_des = self._joint_targets_from_qddot(
+            q, qd, qddot
+        )
 
-        action_p = action.at[wheel_idx].set(0.0)
-        action_d = action.at[leg_idx].set(0.0)
+        # Interleave into qpos[7:]/qvel[6:] order: LEG_DOF_IDS=[0,1,2,4,5,6] get
+        # joint_pos_des in order, WHEEL_DOF_IDS=[3,7] get wheel_vel_des in order.
+        des_config = jp.zeros(consts.NUM_DOFS)
+        des_config = des_config.at[self._leg_ids].set(joint_pos_des)
+        des_config = des_config.at[self._wheel_ids].set(wheel_vel_des)
 
-        dq_desired = qvel + current_qddot * dt                          # ← + qvel attuale
-        q_desired  = qpos + qvel * dt + 0.5 * current_qddot * dt**2   # ← + qpos attuale
+        q_des = des_config
+        v_des = des_config
+        # Same interleaved qpos[7:] order as des_config: 0,1,2=scale_pos, 3=scale_vel, repeat.
+        scaled_action = action * jp.array(
+            ([self._config.action_scale_pos] * 3 + [self._config.action_scale_vel]) * 2
+        )
 
-        #qddot_joints = current_qddot[0, 6:].at[jnp.array([3, 7])].set(0.0)
-        #q_des =  qddot_joints * (self._config.sim_dt**2)
-        #dq_des = qddot_joints * self._config.sim_dt
-        tau_p = self._config.Kp * ( q_desired + action_p*self._config.action_scale - data.qpos[7:])
-        tau_d = self._config.Kd * ( dq_desired + action_d*self._config.action_scale - data.qvel[6:])
+        tau_leg   = self._config.Kp * (q_des + scaled_action - q) - self._config.Kd * qd
+        tau_wheel = self._config.Kd_wheel * (v_des + scaled_action - qd)
 
-        body_pw = 35.0
-        wheel_pw = 0.0
-        body_dw = 0.5
-        wheel_dw = 10.0
-        p_weights = jp.array([body_pw, body_pw, body_pw, wheel_pw]*2)
-        d_weights = jp.array([body_dw, body_dw, body_dw, wheel_dw]*2)
+        ctrl = jp.zeros(self.mjx_model.nu)
+        ctrl = ctrl.at[self._leg_ids].set(tau_leg[self._leg_ids])
+        ctrl = ctrl.at[self._wheel_ids].set(tau_wheel[self._wheel_ids])
 
-        #tau_p = p_weights * (q_desired - data.qpos[7:])
-        #tau_d = d_weights * (dq_desired - data.qvel[6:])
+        ctrl_final = tau + ctrl
 
-        tau_p = tau_p.at[jnp.array([3, 7])].set(0.0)
-
-        tau_network = tau_p + tau_d
-        tau_network = tau_network*(1 - state.info["use_only_mpc"].astype(tau.dtype))
-
-        motor_targets = tau + tau_network
-
-        data = data.replace(ctrl=motor_targets)
+        data = data.replace(ctrl=ctrl_final)
         data = mjx.step(self.mjx_model, data)
-        llc_log = {
-            "tau_ff":      tau_network,
-            "q_des":       jp.zeros_like(data.qpos[7:]),  # q_des,
-            "dq_des":      jp.zeros_like(data.qvel[6:]),  # dq_des,
-            "qacc_joints": jp.zeros_like(data.qvel[6:]),  # qacc_joints,
-            "tau_p":       tau_p,
-            "tau_d":       tau_d,
-            "kp":          jp.array(self._config.Kp),
-            "kd":          jp.array(self._config.Kd),
-            "action_scale": jp.array(self._config.action_scale),
-            "action":      action,
-            "qpos":        data.qpos,
-        }
-        return data, llc_log
-    
-    data, llc_logs = jax.lax.scan(substep_fn, state.data, None, length=self.n_substeps)
-    state.info["low_level_controller"] = jax.tree_util.tree_map(lambda x: x[-1], llc_logs)
+        return data, None
+
+    data, _ = jax.lax.scan(substep_fn, state.data, xs=None, length=self.n_substeps)
     state = state.replace(data=data)
 
-    contact = jp.array([
-        geoms_colliding(data, geom_id, self._floor_geom_id)
-        for geom_id in self._feet_geom_id
-    ])
-    #contact_filt = contact | state.info["last_contact"]
-    #first_contact = (state.info["feet_air_time"] > 0.0) * contact_filt
-    #state.info["feet_air_time"] += self.dt
-    #p_f = data.site_xpos[self._feet_site_id]
-    #p_fz = p_f[..., -1]
-    #state.info["swing_peak"] = jp.maximum(state.info["swing_peak"], p_fz)
+    state.info["joint_pos_des"] = joint_pos_des
+    state.info["wheel_vel_des"] = wheel_vel_des
 
-    obs = self._get_obs(data, state.info)
-    done = self._get_termination(data) | bad
+    # Foot contact bookkeeping (kept for eval/plotting).
+    contact = jp.array([
+        data.sensordata[self._mj_model.sensor_adr[sid]] > 0
+        for sid in self._feet_floor_found_sensor
+    ])
+    contact_filt = contact | state.info["last_contact"]
+    first_contact = (state.info["feet_air_time"] > 0.0) * contact_filt
+    state.info["feet_air_time"] += self.dt
+
+    foot_z = data.site_xpos[self._feet_site_id][..., -1]
+    state.info["swing_peak"] = jp.maximum(state.info["swing_peak"], foot_z)
+    state.info["last_feet_air_time"] = jp.where(
+        first_contact,
+        state.info["feet_air_time"],
+        state.info["last_feet_air_time"],
+    )
+    state.info["last_max_feet_height"] = jp.where(
+        first_contact,
+        state.info["swing_peak"],
+        state.info["last_max_feet_height"],
+    )
+
+    state.info["robot"] = {
+        "qpos": data.qpos,
+        "qvel": data.qvel,
+        "com_height": data.sensordata[self._base_com_adr][2],
+        "local_linvel": self.get_local_linvel(data),
+        "gyro": self.get_gyro(data),
+        "global_linvel": self.get_global_linvel(data),
+        "global_angvel": self.get_global_angvel(data),
+        "gravity": self.get_gravity(data),
+        "upvector": self.get_upvector(data),
+        "accelerometer": self.get_accelerometer(data),
+        "joint_pos": data.qpos[7:],
+        "joint_vel": data.qvel[6:],
+        "actuator_force": data.actuator_force,
+        "ctrl": data.ctrl,
+        "feet_pos": data.site_xpos[self._feet_site_id],
+        "feet_vel": data.sensordata[self._foot_linvel_sensor_adr],
+        "ext_force": data.xfrc_applied[self._torso_body_id, :3],
+        "joint_pos_3d": data.xanchor,
+    }
+
+    obs = self._get_obs(data, state.info, action)
+    done = self._get_termination(data)
 
     rewards = self._get_reward(
-        data, action, state.info, state.metrics, done, contact
+        data, action, state.info, done, first_contact, contact
     )
     rewards = {
         k: v * self._config.reward_config.scales[k] for k, v in rewards.items()
     }
-    reward = jp.clip(sum(rewards.values()) * self.dt, -10000.0, 10000.0)
+    if self._config.reward_config.only_positive_rewards:
+      reward = sum(
+          v for k, v in rewards.items() if k != "termination"
+      ) * self.dt
+      reward = jp.clip(reward, 0.0, 10000.0)
+      reward += rewards["termination"] * self.dt
+    else:
+      reward = jp.clip(sum(rewards.values()) * self.dt, -10000.0, 10000.0)
 
     state.info["reward_terms"] = rewards
 
+    for k, v in rewards.items():
+      state.metrics[f"reward/{k}"] = v
+
+    # Aggiorna i buffer (equivalente della coda di post_physics_step).
+    state.info["step"] += 1
     state.info["last_last_act"] = state.info["last_act"]
     state.info["last_act"] = action
+    state.info["last_dof_vel"] = data.qvel[6:]
+    state.info["feet_air_time"] *= ~contact_filt
+    state.info["swing_peak"] *= ~contact_filt
+    state.info["last_contact"] = contact
+
+    # Ricampionamento comandi a intervallo fisso (Isaac: resampling_time).
     state.info["steps_until_next_cmd"] -= 1
     state.info["rng"], key1, key2 = jax.random.split(state.info["rng"], 3)
     state.info["target_command"] = jp.where(
@@ -602,40 +681,38 @@ class Joystick(tita_base.TitaEnv):
         self.sample_command(key1, state.info["target_command"]),
         state.info["target_command"],
     )
-    # Exponential smoothing: tau ~ 0.4s at ctrl_dt=0.02s
     state.info["command"] = (
         state.info["command"]
         + 0.02 * (state.info["target_command"] - state.info["command"])
     )
     state.info["steps_until_next_cmd"] = jp.where(
-        done | (state.info["steps_until_next_cmd"] <= 0),
+        (state.info["steps_until_next_cmd"] <= 0),
         jp.round(jax.random.exponential(key2) * 5.0 / self.dt).astype(jp.int32),
         state.info["steps_until_next_cmd"],
     )
-    #state.info["feet_air_time"] *= ~contact
-    state.info["last_contact"] = contact
-    #state.info["swing_peak"] *= ~contact
-    for k, v in rewards.items():
-      state.metrics[f"reward/{k}"] = v
-    #state.metrics["swing_peak"] = jp.mean(state.info["swing_peak"])
-    state.info["step_counter"] += 1
 
     done = done.astype(reward.dtype)
     state = state.replace(data=data, obs=obs, reward=reward, done=done)
     return state
 
   def _get_termination(self, data: mjx.Data) -> jax.Array:
+    # Isaac: contatto sui body di terminazione (base). In più: caduta.
     fall_termination = self.get_upvector(data)[-1] < 0.0
-    floating_base_touch_ground = geoms_colliding(data, self._torso_body_id, self._floor_geom_id)
-    nan_qpos = jp.any(jp.isnan(data.qpos))
-    nan_qvel = jp.any(jp.isnan(data.qvel))
-    return (
-        fall_termination | floating_base_touch_ground | nan_qpos | nan_qvel
-    )
+    base_contact = jp.array([
+        geoms_colliding(data, gid, self._floor_geom_id)
+        for gid in self._termination_geom_id
+    ]).any()
+    return fall_termination | base_contact
+
+  # --------------------------------------------------------------------
+  # Observations (proprio "state" + "privileged_state").
+  # --------------------------------------------------------------------
 
   def _get_obs(
-      self, data: mjx.Data, info: dict[str, Any]
+      self, data: mjx.Data, info: dict[str, Any], action: jax.Array
   ) -> Dict[str, jax.Array]:
+    noise = self._config.noise_config
+
     gyro = self.get_gyro(data)
     info["rng"], noise_rng = jax.random.split(info["rng"])
     noisy_gyro = (
@@ -681,337 +758,209 @@ class Joystick(tita_base.TitaEnv):
         * self._config.noise_config.scales.linvel
     )
 
+    # Stessa composizione di Isaac: niente lin_vel, niente pos delle ruote.
+    leg_pos_err = (noisy_joint_angles - self._default_pose)[self._leg_ids]
+    # CoM-height error (com_z - target). The actor was previously BLIND to height:
+    # height only lived in privileged_state (critic). Without this signal the policy
+    # cannot close a loop on CoM_z and slowly sinks. Centred near 0 so the running
+    # obs-normalizer behaves. Same CoM sensor used by the height reward.
+    current_com_height = data.sensordata[self._base_com_adr][2]
+    com_height_err = (current_com_height - info["base_height_target"])
+
+    # MPC augmentation: DFCIP/LIP state + MPC control, so the policy sees what
+    # the MPC/WBC pipeline is planning alongside its own proprioception.
+    # DFCIP state layout (see get_dfip_current_state / reference_generator_dfcip_online):
+    #   x = [pcom(3), vcom(3), c(3), vcontact_z(1), theta(1), v(1), omega(1)]
+    # Delta vs previous step (0 right after reset) instead of the raw absolute
+    # state, since pcom/c drift unbounded in world frame.
     dfcip_state = info["dfcip_state"]
-    noisy_dfcip_state = (
-        dfcip_state
-        + (2 * jax.random.uniform(noise_rng, shape=dfcip_state.shape) - 1)
-        * self._config.noise_config.level
-    )
+    dfcip_state_last = info["dfcip_state_last"] 
+    dfcip_pcom  = dfcip_state[0:3]   - dfcip_state_last[0:3]      # CoM position delta
+    dfcip_vcom  = dfcip_state[3:6]   - dfcip_state_last[3:6]      # CoM velocity delta
+    dfcip_c     = dfcip_state[6:9]   - dfcip_state_last[6:9]      # contact-point (wheel midpoint) position delta
+    dfcip_vc_z  = dfcip_state[9:10]  - dfcip_state_last[9:10]     # contact-point vertical velocity delta
+    dfcip_theta = dfcip_state[10:11] - dfcip_state_last[10:11]    # base yaw delta
+    dfcip_v     = dfcip_state[11:12] - dfcip_state_last[11:12]    # forward velocity delta
+    dfcip_omega = dfcip_state[12:13] - dfcip_state_last[12:13]    # yaw rate delta
+
+    # MPC control: first-stage optimal control u_ref = [a, ac_z, alpha, Fl(3), Fr(3)].
+    # Delta vs previous step (0 right after reset), same treatment as dfcip_state.
+    mpc_control = info["mpc_control"]
+    mpc_control_last = info["mpc_control_last"]  
+    mpc_control_a = mpc_control[0:1]     - mpc_control_last[0:1]   # CoM forward acceleration delta
+    mpc_control_acz = mpc_control[1:2]   - mpc_control_last[1:2]   # CoM vertical acceleration delta
+    mpc_control_alpha = mpc_control[2:3] - mpc_control_last[2:3]   # angular acceleration delta
+    mpc_control_fl = mpc_control[3:6]    - mpc_control_last[3:6]   # left contact-point force delta
+    mpc_control_fr = mpc_control[6:9]    - mpc_control_last[6:9]   # right contact-point force delta
+
+    # Computed in step() (pre-substep qpos/qvel + WBC qddot); see _joint_targets_from_qddot.
+    joint_pos_des = info["joint_pos_des"]           # 6   desired leg joint positions
+    wheel_vel_des = info["wheel_vel_des"]           # 2   desired wheel velocities
 
     state = jp.hstack([
-        noisy_linvel,  # 3
-        noisy_gyro,  # 3
-        noisy_gravity,  # 3
-        noisy_joint_angles, # - self._default_pose,  # 12
-        noisy_joint_vel,  # 12
-        info["last_act"],  # 12
-        info["last_last_act"],  # 12
-        info["command"],  # 3
-        noisy_dfcip_state,  # 18
-    ])
+        noisy_linvel,        # 3   local linear velocity
+        noisy_gyro,          # 3   body angular velocity
+        noisy_gravity,       # 3   projected gravity (tilt)
+        leg_pos_err,         # 6   leg position error vs default
+        (joint_angles - self._default_pose)[self._leg_ids],
+        noisy_joint_vel,     # 8   all joint velocities (incl. wheels)
+        action,              # 8   previous action
+        info["command"],     # 2   [forward_vel, yaw_rate]
+        com_height_err,      # 1   CoM height error (com_z - target)
+        dfcip_pcom,          # 3   MPC: DFCIP state - CoM position
+        dfcip_vcom,          # 3   MPC: DFCIP state - CoM velocity
+        dfcip_c,             # 3   MPC: DFCIP state - contact-point position
+        dfcip_vc_z,          # 1   MPC: DFCIP state - contact-point vertical velocity
+        dfcip_theta,         # 1   MPC: DFCIP state - base yaw
+        dfcip_v,             # 1   MPC: DFCIP state - forward velocity
+        dfcip_omega,         # 1   MPC: DFCIP state - yaw rate
+        mpc_control_a,       # 1   MPC: control - CoM forward acceleration
+        mpc_control_acz,     # 1   MPC: control - CoM vertical acceleration
+        mpc_control_alpha,   # 1   MPC: control - angular acceleration
+        mpc_control_fl,      # 3   MPC: control - left contact force
+        mpc_control_fr,      # 3   MPC: control - right contact force
+        joint_pos_des,       # 6   MPC: desired leg joint positions
+        wheel_vel_des,       # 2   MPC: desired wheel velocities
+    ])  # total: 47
 
     accelerometer = self.get_accelerometer(data)
     angvel = self.get_global_angvel(data)
     feet_vel = data.sensordata[self._foot_linvel_sensor_adr].ravel()
-
     privileged_state = jp.hstack([
-        state,
-        gyro,  # 3
-        accelerometer,  # 3
-        gravity,  # 3
-        linvel,  # 3
-        angvel,  # 3
-        joint_angles, # - self._default_pose,  # 12
-        joint_vel,  # 12
-        data.actuator_force,  # 12
-        info["last_contact"],  # 4
-        feet_vel,  # 4*3
-        #info["feet_air_time"],  # 4
-        data.xfrc_applied[self._torso_body_id, :3],  # 3
-        info["steps_since_last_pert"] >= info["steps_until_next_pert"],  # 1
-    ])
+        state,                                            # 47
+        gyro,                                             # 3
+        accelerometer,                                    # 3
+        gravity,                                          # 3
+        linvel,                                           # 3
+        angvel,                                           # 3
+        #(joint_angles - self._default_pose)[self._leg_ids],  # 6
+        joint_vel,                                        # 8
+        data.actuator_force,                              # 8
+        info["last_contact"],                             # 2
+        feet_vel,                                         # 6
+        info["feet_air_time"],                            # 2
+        current_com_height,                        # 1  base height
+        data.xfrc_applied[self._torso_body_id, :3],       # 3  external push
+    ])  # total: 98
 
-    return {
-        "state": state,
-        "privileged_state": privileged_state,
-    }
+    return {"state": state, "privileged_state": privileged_state}
 
+  # --------------------------------------------------------------------
+  # Rewards.
+  # --------------------------------------------------------------------
   def _get_reward(
       self,
       data: mjx.Data,
       action: jax.Array,
       info: dict[str, Any],
-      metrics: dict[str, Any],
       done: jax.Array,
-      #first_contact: jax.Array,
+      first_contact: jax.Array,
       contact: jax.Array,
   ) -> dict[str, jax.Array]:
-    del metrics  # Unused.
-    current_up = data.site_xmat[self._imu_site_id] @ jp.array([0.0, 0.0, 1.0])
+    del first_contact, contact
+    command = info["command"]
+    body_height = data.sensordata[self._base_com_adr][2]
     return {
+        # Task tracking (raw error -> Gaussian kernel).
         "tracking_lin_vel": self._reward_tracking_lin_vel(
-            info["command"], self.get_local_linvel(data)
-        ),
+            command, self.get_local_linvel(data)),
         "tracking_ang_vel": self._reward_tracking_ang_vel(
-            info["command"], self.get_gyro(data)
-        ),
-        #"virtual_unicycle_lin": self._reward_virtual_unicycle_lin(
-        #    info["command"], data.qvel
-        #),
-        #"virtual_unicycle_ang": self._reward_virtual_unicycle_ang(
-        #    info["command"], data.qvel
-        #),
-        "action_rate_first_order": self._cost_action_rate_first_order(
-            action, info["last_act"]
-        ),
-        "action_rate_second_order": self._cost_action_rate_second_order(
-            action, info["last_act"], info["last_last_act"]
-        ),
-
+            command, self.get_gyro(data)),
+        # Balance / body configuration.
+        "orientation": self._cost_orientation(data),
+        "ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
+        "base_height": self._cost_height(body_height, info["base_height_target"]),
+        "posture": self._cost_posture(data.qpos[7:], command),
+        # Effort / smoothness / safety.
         "torques": self._cost_torques(data.actuator_force),
-        "orientation": self._reward_orientation(data),
-        "base_height": self._cost_height(data.sensordata[self._base_com_adr][2]),
-        "joint_regularization": self._cost_joint_regularization(data.qpos[7:]),
+        "action_rate": self._cost_action_rate(action, info["last_act"]),
+        "dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
+        "dof_vel": self._cost_dof_vel(data.qvel[6:], command),
         "termination": self._cost_termination(done),
-        "wheel_track": self._cost_wheel_track(data),
-
-        #"lin_vel_z": self._cost_lin_vel_z(self.get_global_linvel(data)),
-        #"ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
-        
-        "energy": self._cost_energy(data.qvel[6:], data.actuator_force),
-
-        #"feet_slip": self._cost_feet_slip(data, contact, info),
-        #"feet_clearance": self._cost_feet_clearance(data),
-        #"feet_height": self._cost_feet_height(
-        #    info["swing_peak"], first_contact, info
-        #),
-        #"feet_air_time": self._reward_feet_air_time(
-        #    info["feet_air_time"], first_contact, info["command"]
-        #),
-        #"dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
     }
 
-  # Tracking rewards.
-
-  def _virtual_unicycle_vel(self, qvel: jax.Array) -> jax.Array:
-    """Velocita' (v, omega) del unicycle virtuale ricavate dalle due ruote.
- 
-    v     = r * (w_l + w_r) / 2
-    omega = r * (w_r - w_l) / L
-    """
-    qj = qvel[6:]  # qvel[6:] contiene le velocità delle ruote e delle gambe
-    w_lx = qj[3]
-    w_rx = qj[7]
-
-    # self._wheel_radius = [r_sx, r_dx], stesso ordine di w_sx / w_dx
-    v_lx = self._wheel_radius[0] * w_lx
-    v_rx = self._wheel_radius[1] * w_rx
-
-    v = 0.5 * (v_lx + v_rx)
-    omega = (v_rx - v_lx) / self._wheel_base
-
-    return jp.array([v, omega])
-
   def _reward_tracking_lin_vel(
-      self,
-      commands: jax.Array,
-      local_vel: jax.Array,
+      self, command: jax.Array, local_vel: jax.Array
   ) -> jax.Array:
-    # Tracking of linear velocity commands (xy axes).
-    cmd_curent = commands[:2]
-    local_vel_current = local_vel[:2]
-    
-    term_error = (cmd_curent - local_vel_current) / (1 + jp.abs(cmd_curent))
-    term_norm = jp.sum(jp.square(term_error))
-
-    reward = jp.exp( - term_norm / self._config.reward_config.tracking_sigma )
-    return reward
-
-    #lin_vel_error = jp.sum(jp.square(commands[:2] - local_vel[:2]))
-    #return jp.exp(-lin_vel_error / self._config.reward_config.tracking_sigma)
+    err = jp.square(command[0] - local_vel[0])
+    return jp.exp(-err / self._config.reward_config.tracking_sigma)
 
   def _reward_tracking_ang_vel(
-      self,
-      commands: jax.Array,
-      ang_vel: jax.Array,
+      self, command: jax.Array, gyro: jax.Array
   ) -> jax.Array:
-    # Tracking of angular velocity commands (yaw).
-    cmd_current = commands[2]
-    local_ang_vel_current = ang_vel[2]
+    err = jp.square(command[1] - gyro[2])
+    return jp.exp(-err / self._config.reward_config.tracking_sigma)
 
-    term_error = cmd_current - local_ang_vel_current
-    term_norm = jp.square(term_error)
-
-    reward = jp.exp( - term_norm / self._config.reward_config.tracking_sigma)
-    return reward
-
-    #ang_vel_error = jp.square(commands[2] - ang_vel[2])
-    #return jp.exp(-ang_vel_error / self._config.reward_config.tracking_sigma)
-
-  def _reward_virtual_unicycle_lin(
-        self,
-        commands: jax.Array,
-        qvel: jax.Array,
-    ) -> jax.Array:
-        # Tracking del comando di velocita' lineare con la velocita' delle ruote.
-        cmd_current = commands[0]
-        wheel_lin_vel_current = self._virtual_unicycle_vel(qvel)[0]
-    
-        term_error = cmd_current - wheel_lin_vel_current
-        term_norm = jp.square(term_error)
-    
-        reward = jp.exp(-term_norm / self._config.reward_config.tracking_sigma)
-    
-        return reward
-
-  def _reward_virtual_unicycle_ang(
-        self,
-        commands: jax.Array,
-        qvel: jax.Array,
-    ) -> jax.Array:
-        # Tracking del comando di yaw rate con la velocita' differenziale delle ruote.
-        cmd_current = commands[2]
-        wheel_ang_vel_current = self._virtual_unicycle_vel(qvel)[1]
-    
-        term_error = cmd_current - wheel_ang_vel_current
-        term_norm = jp.square(term_error)
-    
-        reward = jp.exp(-term_norm / self._config.reward_config.tracking_sigma)
-    
-        return reward
-
-  # Base related rewards
-  def _cost_lin_vel_z(self, global_linvel: jax.Array) -> jax.Array:
-    # Penalize z axis base linear velocity.
-    return jp.square(global_linvel[2])
+  def _cost_orientation(self, data: mjx.Data) -> jax.Array:
+    # 0 when the base is level; grows with tilt.
+    return jp.sum(jp.square(self.get_gravity(data)[:2]))
 
   def _cost_ang_vel_xy(self, global_angvel: jax.Array) -> jax.Array:
-    # Penalize xy axes base angular velocity.
     return jp.sum(jp.square(global_angvel[:2]))
 
-  def _reward_orientation(
-      self, data: mjx.Data
-  ) -> jax.Array:
-    term_error = self.get_gravity(data)[:2]
-    term_norm = jp.sum(jp.square(term_error))
+  def _cost_height(self, body_height, base_height_target: jax.Array) -> jax.Array:
+    err = body_height - base_height_target
+    return 1.0 - jp.exp(-jp.square(err / 0.05))
 
-    reward = jp.exp(-term_norm / self._config.reward_config.tracking_sigma)
+  def _cost_posture(self, qpos: jax.Array, command: jax.Array) -> jax.Array:
+    # Neutral leg configuration, but ONLY when close to stationary: the gate
+    # decays as the commanded speed grows, so dynamic leg motion during
+    # locomotion is not penalized. This is the fix for zero-command leg spread:
+    # the hip (highest weight) is pulled back to default whenever standing.
+    err = (qpos - self._default_pose)[self._leg_ids]
+    raw = jp.sum(self._posture_weights * jp.square(err))
+    gate = jp.exp(
+        -jp.sum(jp.square(command))
+        / self._config.reward_config.posture_cmd_sigma
+    )
+    return raw * gate
 
-    return reward
-  
-  def _cost_orientation(self, torso_zaxis: jax.Array) -> jax.Array:
-    # Penalize non flat base orientation.
-    return jp.sum(jp.square(torso_zaxis[:2]))
-
-  def _cost_height(self, body_height: jax.Array) -> jax.Array:
-    # Quadratic penalty instead of exp(-error^2/sigma): the latter saturates
-    # near 1 for height errors of a few cm, making the robot barely feel it.
-    term_error = self._config.reward_config.base_height_target - body_height
-    return jp.sum(jp.square(term_error))
-
-  def _cost_wheel_track(self, data: mjx.Data) -> jax.Array:
-    # Penalize the real wheel-to-wheel distance drifting from the nominal
-    # track width the MPC/WBC assume (config_dfcip.d = 0.567 m).
-    feet_pos = data.site_xpos[self._feet_site_id]
-    dist = jp.linalg.norm(feet_pos[0] - feet_pos[1])
-    return jp.square(dist - self._config.reward_config.wheel_track_target)
-
-  # Energy related rewards.
   def _cost_torques(self, torques: jax.Array) -> jax.Array:
-    # Penalize torques.
+    return jp.sum(jp.square(torques))
 
-    cost = jp.sum(jp.square(torques))
-
-    #return jp.sqrt(jp.sum(jp.square(torques))) + jp.sum(jp.abs(torques))
-    return cost
-
-  def _cost_energy(
-      self, qvel: jax.Array, qfrc_actuator: jax.Array
-  ) -> jax.Array:
-    # Penalize energy consumption.
-    #power = qfrc_actuator * qvel
-    return jp.sum(jp.abs(qvel) * jp.abs(qfrc_actuator))
-    #return jp.sum(jp.maximum(power, 0.0))
-
-  def _cost_action_rate_first_order(
-      self, act: jax.Array, last_act: jax.Array
-  ) -> jax.Array:
-    
-    term_error = (act - last_act)/self._config.ctrl_dt
-    term_norm = jp.sum(jp.square(term_error))
-
-    cost = term_norm  
-
-    return cost
-
-  def _cost_action_rate_second_order(
-      self, act: jax.Array, last_act: jax.Array, last_last_act: jax.Array
-  ) -> jax.Array:
-
-    term_error = (act - 2 * last_act + last_last_act)/self._config.ctrl_dt
-    term_norm = jp.sum(jp.square(term_error))
-
-    cost = term_norm 
-
-    return cost
-
-  # Other rewards.
-
-  def _cost_joint_regularization(self, qpos: jax.Array) -> jax.Array:
-    # Stay close to the default pose.
-    weight = jp.array([1.0, 1.0, 1.0, 0.0] * 2)
-    scale = (1/(self._mj_model.nu-2))
-    return scale * jp.sum(jp.square(qpos - self._default_pose) * weight)
-
-  def _cost_stand_still(
-      self,
-      commands: jax.Array,
-      qpos: jax.Array,
-  ) -> jax.Array:
-    cmd_norm = jp.linalg.norm(commands)
-    return jp.sum(jp.abs(qpos - self._default_pose)) * (cmd_norm < 0.01)
-
-  def _cost_termination(self, done: jax.Array) -> jax.Array:
-    # Penalize early termination.
-    return done
+  def _cost_action_rate(self, act: jax.Array, last_act: jax.Array) -> jax.Array:
+    # Dimensionless action difference (no 1/dt): the global x dt then leaves a
+    # clean per-step magnitude instead of inverting to 1/dt.
+    return jp.sum(jp.square(act - last_act))
 
   def _cost_joint_pos_limits(self, qpos: jax.Array) -> jax.Array:
-    # Penalize joints if they cross soft limits.
-    qpos_reduced = jp.delete(qpos, consts.TITA_WHEEL_INDICES)  # exclude wheels
-    out_of_limits = -jp.clip(qpos_reduced - self._soft_lowers, None, 0.0)
-    out_of_limits += jp.clip(qpos_reduced - self._soft_uppers, 0.0, None)
-    return jp.sum(out_of_limits)
+    q = qpos[self._leg_ids]
+    out = -jp.clip(q - self._soft_lowers, None, 0.0)
+    out += jp.clip(q - self._soft_uppers, 0.0, None)
+    return jp.sum(out)
 
-  # Feet related rewards.
+  def _cost_dof_vel(self, qvel: jax.Array, command: jax.Array) -> jax.Array:
+    leg_qvel = qvel[jp.array(consts.LEG_DOF_IDS)]     # 6 leg DOF, excludes wheels
+    raw  = jp.sum(jp.square(leg_qvel))
+    gate = jp.exp(-jp.sum(jp.square(command))
+                  / 0.25 )#self._config.reward_config.dof_vel_cmd_sigma)
+    return raw #* gate
 
-  def _cost_feet_slip(
-      self, data: mjx.Data, contact: jax.Array, info: dict[str, Any]
-  ) -> jax.Array:
-    cmd_norm = jp.linalg.norm(info["command"])
-    feet_vel = data.sensordata[self._foot_linvel_sensor_adr]
-    vel_xy = feet_vel[..., :2]
-    vel_xy_norm_sq = jp.sum(jp.square(vel_xy), axis=-1)
-    return jp.sum(vel_xy_norm_sq * contact) * (cmd_norm > 0.01)
+  def _cost_termination(self, done: jax.Array) -> jax.Array:
+    return done
 
-  def _cost_feet_clearance(self, data: mjx.Data) -> jax.Array:
-    feet_vel = data.sensordata[self._foot_linvel_sensor_adr]
-    vel_xy = feet_vel[..., :2]
-    vel_norm = jp.sqrt(jp.linalg.norm(vel_xy, axis=-1))
-    foot_pos = data.site_xpos[self._feet_site_id]
-    foot_z = foot_pos[..., -1]
-    delta = jp.abs(foot_z - self._config.reward_config.max_foot_height)
-    return jp.sum(delta * vel_norm)
+  # --------------------------------------------------------------------
+  # Commands and perturbations.
+  # --------------------------------------------------------------------
 
-  def _cost_feet_height(
-      self,
-      swing_peak: jax.Array,
-      first_contact: jax.Array,
-      info: dict[str, Any],
-  ) -> jax.Array:
-    cmd_norm = jp.linalg.norm(info["command"])
-    error = swing_peak / self._config.reward_config.max_foot_height - 1.0
-    return jp.sum(jp.square(error) * first_contact) * (cmd_norm > 0.01)
+  def sample_command(self, rng: jax.Array, x_k: jax.Array) -> jax.Array:
+    rng, y_rng, w_rng, z_rng = jax.random.split(rng, 4)
+    cmd_shape = self._cmd_a.shape[0]
+    y_k = jax.random.uniform(
+        y_rng, shape=(cmd_shape,), minval=-self._cmd_a, maxval=self._cmd_a
+    )
+    z_k = jax.random.bernoulli(z_rng, self._cmd_b, shape=(cmd_shape,))
+    w_k = jax.random.bernoulli(w_rng, 0.5, shape=(cmd_shape,))
+    x_kp1 = x_k - w_k * (x_k - y_k * z_k)
+    return x_kp1
 
-  def _reward_feet_air_time(
-      self, air_time: jax.Array, first_contact: jax.Array, commands: jax.Array
-  ) -> jax.Array:
-    # Reward air time.
-    cmd_norm = jp.linalg.norm(commands)
-    rew_air_time = jp.sum((air_time - 0.1) * first_contact)
-    rew_air_time *= cmd_norm > 0.01  # No reward for zero commands.
-    return rew_air_time
-
-  # Perturbation and command sampling.
+  def sample_height(self, rng: jax.Array) -> jax.Array:
+    return jax.random.uniform(
+        rng,
+        shape=(),
+        minval=self._cmd_h[0],
+        maxval=self._cmd_h[1],
+    )
 
   def _maybe_apply_perturbation(self, state: mjx_env.State) -> mjx_env.State:
     def gen_dir(rng: jax.Array) -> jax.Array:
@@ -1021,12 +970,11 @@ class Joystick(tita_base.TitaEnv):
     def apply_pert(state: mjx_env.State) -> mjx_env.State:
       t = state.info["pert_steps"] * self.dt
       u_t = 0.5 * jp.sin(jp.pi * t / state.info["pert_duration_seconds"])
-      # kg * m/s * 1/s = m/s^2 = kg * m/s^2 (N).
       force = (
-          u_t  # (unitless)
-          * self._torso_mass  # kg
-          * state.info["pert_mag"]  # m/s
-          / state.info["pert_duration_seconds"]  # 1/s
+          u_t
+          * self._torso_mass
+          * state.info["pert_mag"]
+          / state.info["pert_duration_seconds"]
       )
       xfrc_applied = jp.zeros((self.mjx_model.nbody, 6))
       xfrc_applied = xfrc_applied.at[self._torso_body_id, :3].set(
@@ -1047,17 +995,13 @@ class Joystick(tita_base.TitaEnv):
       state.info["steps_since_last_pert"] += 1
       xfrc_applied = jp.zeros((self.mjx_model.nbody, 6))
       data = state.data.replace(xfrc_applied=xfrc_applied)
-      state.info["pert_steps"] = jp.where(
+      trigger = (
           state.info["steps_since_last_pert"]
-          >= state.info["steps_until_next_pert"],
-          0,
-          state.info["pert_steps"],
+          >= state.info["steps_until_next_pert"]
       )
+      state.info["pert_steps"] = jp.where(trigger, 0, state.info["pert_steps"])
       state.info["pert_dir"] = jp.where(
-          state.info["steps_since_last_pert"]
-          >= state.info["steps_until_next_pert"],
-          gen_dir(rng),
-          state.info["pert_dir"],
+          trigger, gen_dir(rng), state.info["pert_dir"]
       )
       return state.replace(data=data)
 
@@ -1068,13 +1012,3 @@ class Joystick(tita_base.TitaEnv):
         wait,
         state,
     )
-
-  def sample_command(self, rng: jax.Array, x_k: jax.Array) -> jax.Array:
-    rng, y_rng, w_rng, z_rng = jax.random.split(rng, 4)
-    y_k = jax.random.uniform(
-        y_rng, shape=(3,), minval=-self._cmd_a, maxval=self._cmd_a
-    )
-    z_k = jax.random.bernoulli(z_rng, self._cmd_b, shape=(3,))
-    w_k = jax.random.bernoulli(w_rng, 0.5, shape=(3,))
-    x_kp1 = x_k - w_k * (x_k - y_k * z_k)
-    return x_kp1
