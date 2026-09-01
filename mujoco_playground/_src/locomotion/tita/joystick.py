@@ -61,13 +61,9 @@ def default_config() -> config_dict.ConfigDict:
       episode_length=1000,
       Kp=50.0,
       Kd=1.0,
-      Kd_wheel=0.5,      # kv delle ruote (velocity control)
+      Kd_wheel=0.5,
       action_repeat=1,
       action_scale_pos=0.5,
-      # 5.0 -> executed wheel law tau = 0.5*(5*a - w) = 2.5*a - 0.5*w, IDENTICAL to the
-      # DDT Isaac Gym reference (2.5*a - 0.5*w). Was 30.0, which gave 15*a - 0.5*w:
-      # 6x the reference feedforward, i.e. a unit action produced ~3-4x the corrective
-      # torque a moderate lean needs (~4 N*m/wheel at 0.1 rad) -> over-twitchy wheels.
       action_scale_vel=25.0,
       soft_joint_pos_limit_factor=0.95, 
       noise_config=config_dict.create(
@@ -96,7 +92,7 @@ def default_config() -> config_dict.ConfigDict:
           ),
           only_positive_rewards=False,
           tracking_sigma=0.0625,
-          base_height_target=0.4,   # task target; home-pose COM is ~0.3956 (inside the 2 cm deadzone)
+          base_height_target=0.4, 
           posture_cmd_sigma=0.25,     # gate width: posture relaxes as |command| grows
       ),
       pert_config=config_dict.create(
@@ -110,7 +106,6 @@ def default_config() -> config_dict.ConfigDict:
           a=[1.0, 0.5],     # amplitude (uniform half-range) per command
           b=[0.75, 0.75],    # prob a resampled command stays non-zero
           h=[0.4, 0.4],    # CoM height command range [min, max] [m]
-          p_stand=0.2,      # prob of an explicit zero (standing) command
       ),
       impl="jax",
       naconmax=4 * 8192,
@@ -136,10 +131,6 @@ class Joystick(tita_base.TitaEnv):
 
   def _post_init(self) -> None:
     self._init_q = jp.array(self._mj_model.keyframe("home").qpos)
-    # The "home" keyframe spawns the base at z=0.44, which puts each wheel bottom at
-    # -0.0035 m (3.5 mm below the floor) -> a contact impulse on every reset. Lift the
-    # base by 3.5 mm so the wheels just touch. (Pose/COM unchanged: COM ~0.3956 m, still
-    # inside the 2 cm height-reward deadzone around the 0.4 target.)
     self._init_q = self._init_q.at[2].set(0.4435)
     self._default_pose = jp.array(self._mj_model.keyframe("home").qpos[7:])
 
@@ -183,10 +174,8 @@ class Joystick(tita_base.TitaEnv):
     self._cmd_a = jp.array(self._config.command_config.a)
     self._cmd_b = jp.array(self._config.command_config.b)
     self._cmd_h = jp.array(self._config.command_config.h)
+    self._cmd_resample_scale = 0.5 * self._config.episode_length * self.dt
 
-    # Posture weights over the 6 leg joints [hip, thigh, knee] x 2.
-    # The hip (leg_1) is the "spread" DOF (d(track)/d(hip) ~ 0.35 m/rad), so it
-    # gets the highest weight.
     self._posture_weights = jp.array([1.0, 0.5, 0.5, 1.0, 0.5, 0.5])
 
     self._base_com_linvel_adr = self._sensor_adr("base_subtree_linvel")
@@ -274,11 +263,20 @@ class Joystick(tita_base.TitaEnv):
     nj actuated joints in qpos[7:]/qvel[6:] order."""
     dt = self._config.sim_dt
     qddot_joint = qddot[0, 6:]
-    dq_desired = qvel_joint + qddot_joint * dt
-    q_desired = qpos_joint + qvel_joint * dt + 0.5 * qddot_joint * dt**2
-    joint_pos_des = q_desired[self._leg_ids]
-    wheel_vel_des = dq_desired[self._wheel_ids]
-    return joint_pos_des, wheel_vel_des
+    dq_target = qvel_joint + qddot_joint * dt
+    q_target = qpos_joint + qvel_joint * dt + 0.5 * qddot_joint * dt**2
+    return q_target, dq_target
+
+  def _compute_joint_desired(self, action, qpos_joint, qvel_joint, qddot):
+    #q_target, dq_target = self._joint_targets_from_qddot(qpos_joint, qvel_joint, qddot)
+    
+    q_target = self._default_pose
+    dq_target = jp.zeros_like(action)
+
+    q_des = q_target + action * self._config.action_scale_pos
+    dq_des = dq_target + action * self._config.action_scale_vel
+
+    return q_des, dq_des
 
   # --------------------------------------------------------------------
   # Reset / step.
@@ -306,6 +304,9 @@ class Joystick(tita_base.TitaEnv):
     rng, key = jax.random.split(rng)
     vy = jax.random.uniform(key, (1,), minval=-0.1, maxval=0.1)
     #qvel = qvel.at[0:2].set(jp.concatenate([vx, vy]))
+    rng, key = jax.random.split(rng)
+    joint_vel = jax.random.uniform(key, shape=qvel[6:].shape, minval=-0.2, maxval=0.2,)
+    #qvel = qvel.at[6:].set(joint_vel)
 
     ctrl = jp.zeros(self.mjx_model.nu)
 
@@ -344,7 +345,7 @@ class Joystick(tita_base.TitaEnv):
     )
 
     rng, key1, key2 = jax.random.split(rng, 3)
-    time_until_next_cmd = jax.random.exponential(key1) * 5.0
+    time_until_next_cmd = jax.random.exponential(key1) * self._cmd_resample_scale
     steps_until_next_cmd = jp.round(time_until_next_cmd / self.dt).astype(
         jp.int32
     )
@@ -373,8 +374,11 @@ class Joystick(tita_base.TitaEnv):
         timestep=0
         )
 
-    joint_pos_des, wheel_vel_des = self._joint_targets_from_qddot(
-        data.qpos[7:], data.qvel[6:], mpc_qddot
+    q_des, dq_des = self._compute_joint_desired(
+        action=jp.zeros(self.mjx_model.nu),
+        qpos_joint=data.qpos[7:],
+        qvel_joint=data.qvel[6:],
+        qddot=mpc_qddot,
     )
 
     info = {
@@ -425,6 +429,7 @@ class Joystick(tita_base.TitaEnv):
         "mpc_state": mpc_state,       # persistent MPC/WBC internal state (pytree)
         "mpc_state_last": mpc_state,  # previous-step MPC/WBC state, for delta obs (0 on reset)
         "theta_prev": theta_prev,     # unwrapped yaw carried across steps
+        "tita_state": tita_state,     # raw 18-vec [pcom,vcom,pl,pr,dpl,dpr] (LOGGED ONLY)
         "dfcip_state": dfcip_state,   # DFCIP state x0 (feeds plot_command_tracking)
         "dfcip_state_last": dfcip_state,  # previous-step DFCIP state, for delta obs (0 on reset)
         "mpc_tau": mpc_tau,           # WBC feedforward torque (LOGGED ONLY)
@@ -436,8 +441,8 @@ class Joystick(tita_base.TitaEnv):
         "mpc_control_last": mpc_reference[0][0, 13:],  # previous-step u_ref, for delta obs (0 on reset)
         # WBC desired vector (com/wheel/base/joint refs); obs slices out q/wheel-vel desired.
         "mpc_desired": desired[0],
-        "joint_pos_des": joint_pos_des,  # desired leg joint positions (integrated from WBC qddot)
-        "wheel_vel_des": wheel_vel_des,  # desired wheel velocities (integrated from WBC qddot)
+        "joint_pos_des": q_des,  # desired leg joint positions (integrated from WBC qddot)
+        "wheel_vel_des": dq_des,  # desired wheel velocities (integrated from WBC qddot)
         "reward_terms" : {}
     }
 
@@ -474,7 +479,7 @@ class Joystick(tita_base.TitaEnv):
     tita_state = self.build_tita_state(data)
     x0, theta_prev = self.get_dfip_current_state(tita_state, theta_prev)
 
-    mpc_command = jp.array([command[0], command[1], command[2], base_height_target])
+    mpc_command = jp.array([command[0], 0.0, command[1], base_height_target])
     mpc_state, reference = self.mpc.run(mpc_state, x0[None, :], mpc_command[None, :])
 
     pl_world_wbc = tita_state[6:9][None, :]
@@ -542,6 +547,7 @@ class Joystick(tita_base.TitaEnv):
     state.info["mpc_tau"]       = tau
     state.info["mpc_qddot"]     = qddot
     state.info["theta_prev"]    = theta_prev
+    state.info["tita_state"]    = tita_state
     state.info["dfcip_state"]   = dfcip_state
     state.info["mpc_grf_left"]  = mpc_fl
     state.info["mpc_grf_right"] = mpc_fr
@@ -553,50 +559,43 @@ class Joystick(tita_base.TitaEnv):
 
     # Computed here (pre-substep qpos/qvel, same instant as the qddot above),
     # written to state.info only after the substep loop below.
-    joint_pos_des, wheel_vel_des = self._joint_targets_from_qddot(
-       state.data.qpos[7:], state.data.qvel[6:], qddot
+
+    q_des, dq_des = self._compute_joint_desired(
+        action=action,
+        qpos_joint=state.data.qpos[7:],
+        qvel_joint=state.data.qvel[6:],
+        qddot=qddot,
     )
 
     def substep_fn(data, _):
         q  = data.qpos[7:]
         qd = data.qvel[6:]
 
+        #q_des, dq_des = self._compute_joint_desired(
+        #    action=action,
+        #    qpos_joint=state.data.qpos[7:],
+        #    qvel_joint=state.data.qvel[6:],
+        #    qddot=qddot,
+        #)
 
-        joint_pos_des, wheel_vel_des = self._joint_targets_from_qddot(
-            q, qd, qddot
-        )
+        tau_leg   = self._config.Kp * (q_des - q) - self._config.Kd * qd
+        tau_wheel = self._config.Kd_wheel * (dq_des - qd)
 
-        # Interleave into qpos[7:]/qvel[6:] order: LEG_DOF_IDS=[0,1,2,4,5,6] get
-        # joint_pos_des in order, WHEEL_DOF_IDS=[3,7] get wheel_vel_des in order.
-        des_config = jp.zeros(consts.NUM_DOFS)
-        des_config = des_config.at[self._leg_ids].set(joint_pos_des)
-        des_config = des_config.at[self._wheel_ids].set(wheel_vel_des)
+        ctrl_nn = jp.zeros(self.mjx_model.nu)
+        ctrl_nn = ctrl_nn.at[self._leg_ids].set(tau_leg[self._leg_ids])
+        ctrl_nn = ctrl_nn.at[self._wheel_ids].set(tau_wheel[self._wheel_ids])
 
-        q_des = des_config
-        v_des = des_config
-        # Same interleaved qpos[7:] order as des_config: 0,1,2=scale_pos, 3=scale_vel, repeat.
-        scaled_action = action * jp.array(
-            ([self._config.action_scale_pos] * 3 + [self._config.action_scale_vel]) * 2
-        )
+        ctrl = ctrl_nn #+ tau
 
-        tau_leg   = self._config.Kp * (q_des + scaled_action - q) - self._config.Kd * qd
-        tau_wheel = self._config.Kd_wheel * (v_des + scaled_action - qd)
-
-        ctrl = jp.zeros(self.mjx_model.nu)
-        ctrl = ctrl.at[self._leg_ids].set(tau_leg[self._leg_ids])
-        ctrl = ctrl.at[self._wheel_ids].set(tau_wheel[self._wheel_ids])
-
-        ctrl_final = tau + ctrl
-
-        data = data.replace(ctrl=ctrl_final)
+        data = data.replace(ctrl=ctrl)
         data = mjx.step(self.mjx_model, data)
         return data, None
 
     data, _ = jax.lax.scan(substep_fn, state.data, xs=None, length=self.n_substeps)
     state = state.replace(data=data)
 
-    state.info["joint_pos_des"] = joint_pos_des
-    state.info["wheel_vel_des"] = wheel_vel_des
+    state.info["joint_pos_des"] = q_des
+    state.info["wheel_vel_des"] = dq_des
 
     # Foot contact bookkeeping (kept for eval/plotting).
     contact = jp.array([
@@ -674,7 +673,7 @@ class Joystick(tita_base.TitaEnv):
     state.info["last_contact"] = contact
 
     # Ricampionamento comandi a intervallo fisso (Isaac: resampling_time).
-    state.info["steps_until_next_cmd"] -= 1
+    state.info["steps_until_next_cmd"] -= 0
     state.info["rng"], key1, key2 = jax.random.split(state.info["rng"], 3)
     state.info["target_command"] = jp.where(
         state.info["steps_until_next_cmd"] <= 0,
@@ -687,7 +686,7 @@ class Joystick(tita_base.TitaEnv):
     )
     state.info["steps_until_next_cmd"] = jp.where(
         (state.info["steps_until_next_cmd"] <= 0),
-        jp.round(jax.random.exponential(key2) * 5.0 / self.dt).astype(jp.int32),
+        jp.round(jax.random.exponential(key2) * self._cmd_resample_scale / self.dt).astype(jp.int32),
         state.info["steps_until_next_cmd"],
     )
 
@@ -758,8 +757,6 @@ class Joystick(tita_base.TitaEnv):
         * self._config.noise_config.scales.linvel
     )
 
-    # Stessa composizione di Isaac: niente lin_vel, niente pos delle ruote.
-    leg_pos_err = (noisy_joint_angles - self._default_pose)[self._leg_ids]
     # CoM-height error (com_z - target). The actor was previously BLIND to height:
     # height only lived in privileged_state (critic). Without this signal the policy
     # cannot close a loop on CoM_z and slowly sinks. Centred near 0 so the running
@@ -778,10 +775,10 @@ class Joystick(tita_base.TitaEnv):
     dfcip_pcom  = dfcip_state[0:3]   - dfcip_state_last[0:3]      # CoM position delta
     dfcip_vcom  = dfcip_state[3:6]   - dfcip_state_last[3:6]      # CoM velocity delta
     dfcip_c     = dfcip_state[6:9]   - dfcip_state_last[6:9]      # contact-point (wheel midpoint) position delta
-    dfcip_vc_z  = dfcip_state[9:10]  - dfcip_state_last[9:10]     # contact-point vertical velocity delta
-    dfcip_theta = dfcip_state[10:11] - dfcip_state_last[10:11]    # base yaw delta
+    dfcip_vc_z  = dfcip_state[9:10]  #- dfcip_state_last[9:10]     # contact-point vertical velocity delta
+    dfcip_theta = dfcip_state[10:11] #- dfcip_state_last[10:11]    # base yaw delta
     dfcip_v     = dfcip_state[11:12] - dfcip_state_last[11:12]    # forward velocity delta
-    dfcip_omega = dfcip_state[12:13] - dfcip_state_last[12:13]    # yaw rate delta
+    dfcip_omega = dfcip_state[12:13] #- dfcip_state_last[12:13]    # yaw rate delta
 
     # MPC control: first-stage optimal control u_ref = [a, ac_z, alpha, Fl(3), Fr(3)].
     # Delta vs previous step (0 right after reset), same treatment as dfcip_state.
@@ -801,27 +798,26 @@ class Joystick(tita_base.TitaEnv):
         noisy_linvel,        # 3   local linear velocity
         noisy_gyro,          # 3   body angular velocity
         noisy_gravity,       # 3   projected gravity (tilt)
-        leg_pos_err,         # 6   leg position error vs default
-        (joint_angles - self._default_pose)[self._leg_ids],
+        (noisy_joint_angles - self._default_pose)[self._leg_ids],         # 6   leg position error vs default
         noisy_joint_vel,     # 8   all joint velocities (incl. wheels)
         action,              # 8   previous action
         info["command"],     # 2   [forward_vel, yaw_rate]
         com_height_err,      # 1   CoM height error (com_z - target)
-        dfcip_pcom,          # 3   MPC: DFCIP state - CoM position
-        dfcip_vcom,          # 3   MPC: DFCIP state - CoM velocity
-        dfcip_c,             # 3   MPC: DFCIP state - contact-point position
-        dfcip_vc_z,          # 1   MPC: DFCIP state - contact-point vertical velocity
-        dfcip_theta,         # 1   MPC: DFCIP state - base yaw
-        dfcip_v,             # 1   MPC: DFCIP state - forward velocity
-        dfcip_omega,         # 1   MPC: DFCIP state - yaw rate
-        mpc_control_a,       # 1   MPC: control - CoM forward acceleration
-        mpc_control_acz,     # 1   MPC: control - CoM vertical acceleration
-        mpc_control_alpha,   # 1   MPC: control - angular acceleration
-        mpc_control_fl,      # 3   MPC: control - left contact force
-        mpc_control_fr,      # 3   MPC: control - right contact force
-        joint_pos_des,       # 6   MPC: desired leg joint positions
-        wheel_vel_des,       # 2   MPC: desired wheel velocities
-    ])  # total: 47
+        #dfcip_pcom,          # 3   MPC: DFCIP state - CoM position
+        #dfcip_vcom,          # 3   MPC: DFCIP state - CoM velocity
+        #dfcip_c,             # 3   MPC: DFCIP state - contact-point position
+        #dfcip_vc_z,          # 1   MPC: DFCIP state - contact-point vertical velocity
+        #dfcip_theta,         # 1   MPC: DFCIP state - base yaw
+        #dfcip_v,             # 1   MPC: DFCIP state - forward velocity
+        #dfcip_omega,         # 1   MPC: DFCIP state - yaw rate
+        #mpc_control_a,       # 1   MPC: control - CoM forward acceleration
+        #mpc_control_acz,     # 1   MPC: control - CoM vertical acceleration
+        #mpc_control_alpha,   # 1   MPC: control - angular acceleration
+        #mpc_control_fl,      # 3   MPC: control - left contact force
+        #mpc_control_fr,      # 3   MPC: control - right contact force
+        #joint_pos_des[self._leg_ids],       # 6   MPC: desired leg joint positions
+        #wheel_vel_des[self._wheel_ids],     # 2   MPC: desired wheel velocities
+    ])  
 
     accelerometer = self.get_accelerometer(data)
     angvel = self.get_global_angvel(data)
@@ -833,7 +829,7 @@ class Joystick(tita_base.TitaEnv):
         gravity,                                          # 3
         linvel,                                           # 3
         angvel,                                           # 3
-        #(joint_angles - self._default_pose)[self._leg_ids],  # 6
+        (joint_angles - self._default_pose)[self._leg_ids],  # 6
         joint_vel,                                        # 8
         data.actuator_force,                              # 8
         info["last_contact"],                             # 2
@@ -841,7 +837,7 @@ class Joystick(tita_base.TitaEnv):
         info["feet_air_time"],                            # 2
         current_com_height,                        # 1  base height
         data.xfrc_applied[self._torso_body_id, :3],       # 3  external push
-    ])  # total: 98
+    ])  
 
     return {"state": state, "privileged_state": privileged_state}
 
