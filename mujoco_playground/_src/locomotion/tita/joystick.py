@@ -63,8 +63,8 @@ def default_config() -> config_dict.ConfigDict:
       Kd=1.0,
       Kd_wheel=0.5,
       action_repeat=1,
-      action_scale_pos=0.5,
-      action_scale_vel=25.0,
+      action_scale_pos=0.5, # prova 0.3
+      action_scale_vel=25.0, # prova 15.0
       soft_joint_pos_limit_factor=0.95, 
       noise_config=config_dict.create(
           level=0.0,
@@ -80,6 +80,8 @@ def default_config() -> config_dict.ConfigDict:
           scales=config_dict.create(
               tracking_lin_vel=1.0,
               tracking_ang_vel=0.5,
+              tracking_mpc_accel=0.0,
+              tracking_mpc_alpha=0.0,
               orientation=-1.0,
               ang_vel_xy=-0.3,
               base_height=-1.0,
@@ -92,6 +94,7 @@ def default_config() -> config_dict.ConfigDict:
           ),
           only_positive_rewards=False,
           tracking_sigma=0.0625,
+          mpc_tracking_sigma=0.0625,
           base_height_target=0.4, 
           posture_cmd_sigma=0.25,     # gate width: posture relaxes as |command| grows
       ),
@@ -391,6 +394,8 @@ class Joystick(tita_base.TitaEnv):
         "last_act": jp.zeros(self.mjx_model.nu),
         "last_last_act": jp.zeros(self.mjx_model.nu),
         "last_dof_vel": jp.zeros(consts.NUM_DOFS),
+        "last_local_linvel": self.get_local_linvel(data),
+        "last_gyro": self.get_gyro(data),
         "feet_air_time": jp.zeros(2),
         "last_feet_air_time": jp.zeros(2),
         "last_contact": jp.zeros(2, dtype=bool),
@@ -585,7 +590,7 @@ class Joystick(tita_base.TitaEnv):
         ctrl_nn = ctrl_nn.at[self._leg_ids].set(tau_leg[self._leg_ids])
         ctrl_nn = ctrl_nn.at[self._wheel_ids].set(tau_wheel[self._wheel_ids])
 
-        ctrl = ctrl_nn #+ tau
+        ctrl = ctrl_nn + tau
 
         data = data.replace(ctrl=ctrl)
         data = mjx.step(self.mjx_model, data)
@@ -668,6 +673,8 @@ class Joystick(tita_base.TitaEnv):
     state.info["last_last_act"] = state.info["last_act"]
     state.info["last_act"] = action
     state.info["last_dof_vel"] = data.qvel[6:]
+    state.info["last_local_linvel"] = self.get_local_linvel(data)   
+    state.info["last_gyro"] = self.get_gyro(data)                   
     state.info["feet_air_time"] *= ~contact_filt
     state.info["swing_peak"] *= ~contact_filt
     state.info["last_contact"] = contact
@@ -784,15 +791,22 @@ class Joystick(tita_base.TitaEnv):
     # Delta vs previous step (0 right after reset), same treatment as dfcip_state.
     mpc_control = info["mpc_control"]
     mpc_control_last = info["mpc_control_last"]  
-    mpc_control_a = mpc_control[0:1]     - mpc_control_last[0:1]   # CoM forward acceleration delta
-    mpc_control_acz = mpc_control[1:2]   - mpc_control_last[1:2]   # CoM vertical acceleration delta
-    mpc_control_alpha = mpc_control[2:3] - mpc_control_last[2:3]   # angular acceleration delta
-    mpc_control_fl = mpc_control[3:6]    - mpc_control_last[3:6]   # left contact-point force delta
-    mpc_control_fr = mpc_control[6:9]    - mpc_control_last[6:9]   # right contact-point force delta
+    mpc_control_a = mpc_control[0:1]     #- mpc_control_last[0:1]   # CoM forward acceleration delta
+    mpc_control_acz = mpc_control[1:2]   #- mpc_control_last[1:2]   # CoM vertical acceleration delta
+    mpc_control_alpha = mpc_control[2:3] #- mpc_control_last[2:3]   # angular acceleration delta
+    #half_weight = config.mass * config.grav / 2.0  # nominal static load per wheel (~27 kg robot)
+    mpc_control_fl = mpc_control[3:6] #/ half_weight    #- mpc_control_last[3:6]   # left contact-point force delta
+    mpc_control_fr = mpc_control[6:9] #/ half_weight    #- mpc_control_last[6:9]   # right contact-point force delta
 
     # Computed in step() (pre-substep qpos/qvel + WBC qddot); see _joint_targets_from_qddot.
     joint_pos_des = info["joint_pos_des"]           # 6   desired leg joint positions
     wheel_vel_des = info["wheel_vel_des"]           # 2   desired wheel velocities
+
+    q_target, dq_target = self._joint_targets_from_qddot(
+        qpos_joint=joint_angles,
+        qvel_joint=joint_vel,
+        qddot=info["mpc_qddot"],
+    )
 
     state = jp.hstack([
         noisy_linvel,        # 3   local linear velocity
@@ -810,11 +824,12 @@ class Joystick(tita_base.TitaEnv):
         #dfcip_theta,         # 1   MPC: DFCIP state - base yaw
         #dfcip_v,             # 1   MPC: DFCIP state - forward velocity
         #dfcip_omega,         # 1   MPC: DFCIP state - yaw rate
-        #mpc_control_a,       # 1   MPC: control - CoM forward acceleration
-        #mpc_control_acz,     # 1   MPC: control - CoM vertical acceleration
-        #mpc_control_alpha,   # 1   MPC: control - angular acceleration
-        #mpc_control_fl,      # 3   MPC: control - left contact force
-        #mpc_control_fr,      # 3   MPC: control - right contact force
+        mpc_control_a,       # 1   MPC: control - CoM forward acceleration
+        mpc_control_acz,     # 1   MPC: control - CoM vertical acceleration
+        mpc_control_alpha,   # 1   MPC: control - angular acceleration
+        mpc_control_fl,      # 3   MPC: control - left contact force
+        mpc_control_fr,      # 3   MPC: control - right contact force
+        info["mpc_tau"],          # 8   MPC: WBC feedforward torque
         #joint_pos_des[self._leg_ids],       # 6   MPC: desired leg joint positions
         #wheel_vel_des[self._wheel_ids],     # 2   MPC: desired wheel velocities
     ])  
@@ -862,6 +877,8 @@ class Joystick(tita_base.TitaEnv):
             command, self.get_local_linvel(data)),
         "tracking_ang_vel": self._reward_tracking_ang_vel(
             command, self.get_gyro(data)),
+        "tracking_mpc_accel": self._reward_mpc_accel(data, info),
+        "tracking_mpc_alpha": self._reward_mpc_alpha(data, info),
         # Balance / body configuration.
         "orientation": self._cost_orientation(data),
         "ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
@@ -886,6 +903,36 @@ class Joystick(tita_base.TitaEnv):
   ) -> jax.Array:
     err = jp.square(command[1] - gyro[2])
     return jp.exp(-err / self._config.reward_config.tracking_sigma)
+  
+  # in _post_init / config:  mpc_tracking_sigma = 0.5   (adimensionale, come tracking_sigma)
+
+  def _reward_mpc_accel(self, data, info):
+    dt = self.dt
+    lin = self.get_local_linvel(data)
+    a_real = (lin[0] - info["last_local_linvel"][0]) / dt
+
+    # MPC control: [a, ac_z, alpha, Fl(3), Fr(3)]
+    a_cmd = info["mpc_control"][0]
+
+    a_scale = 2.0  # m/s^2
+    error = jp.square((a_real - a_cmd) / a_scale)
+
+    return jp.exp(-error / self._config.reward_config.mpc_tracking_sigma)
+
+
+  def _reward_mpc_alpha(self, data, info):
+    dt = self.dt
+    gyro = self.get_gyro(data)
+    alpha_real = (gyro[2] - info["last_gyro"][2]) / dt
+
+    # MPC control: [a, ac_z, alpha, Fl(3), Fr(3)]
+    alpha_cmd = info["mpc_control"][2]
+
+    alpha_scale = 4.0  # rad/s^2
+    error = jp.square((alpha_real - alpha_cmd) / alpha_scale)
+
+    return jp.exp(-error / self._config.reward_config.mpc_tracking_sigma)
+
 
   def _cost_orientation(self, data: mjx.Data) -> jax.Array:
     # 0 when the base is level; grows with tilt.
