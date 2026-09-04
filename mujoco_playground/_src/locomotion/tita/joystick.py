@@ -271,10 +271,16 @@ class Joystick(tita_base.TitaEnv):
     return q_target, dq_target
 
   def _compute_joint_desired(self, action, qpos_joint, qvel_joint, qddot):
-    #q_target, dq_target = self._joint_targets_from_qddot(qpos_joint, qvel_joint, qddot)
-    
-    q_target = self._default_pose
-    dq_target = jp.zeros_like(action)
+    # NOTE: this previously used a fixed q_target = self._default_pose,
+    # decoupling the residual policy's PD target from the MPC/WBC's own
+    # planned trajectory -- the only historically-converged residual run
+    # (checkpoints/TitaJoystickFlatTerrain/saved/first_training_residual)
+    # used the qddot-integrated target below. With a fixed default-pose
+    # target, "residual" only means "torque summed with an RL-blind WBC
+    # torque"; restoring this makes the policy's PD target track what the
+    # WBC actually planned for this step, which is what "residual on top
+    # of the controller's plan" is supposed to mean.
+    q_target, dq_target = self._joint_targets_from_qddot(qpos_joint, qvel_joint, qddot)
 
     q_des = q_target + action * self._config.action_scale_pos
     dq_des = dq_target + action * self._config.action_scale_vel
@@ -680,7 +686,11 @@ class Joystick(tita_base.TitaEnv):
     state.info["last_contact"] = contact
 
     # Ricampionamento comandi a intervallo fisso (Isaac: resampling_time).
-    state.info["steps_until_next_cmd"] -= 0
+    # NOTE: was "-= 0" (in-progress/debug edit), which disabled the
+    # countdown entirely -- commands would only ever resample once the
+    # counter happened to already be <=0 from initialization, never again
+    # after that.
+    state.info["steps_until_next_cmd"] -= 1
     state.info["rng"], key1, key2 = jax.random.split(state.info["rng"], 3)
     state.info["target_command"] = jp.where(
         state.info["steps_until_next_cmd"] <= 0,
