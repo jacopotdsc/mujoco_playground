@@ -7,3 +7,7 @@ mujoco_menagerie
 checkpoints/
 logs
 .mujoco_playground_asset_cache/
+
+# JAX persistent compilation cache
+jax_cache/
+.jax_cache/
