@@ -53,8 +53,11 @@ def default_config() -> config_dict.ConfigDict:
       ctrl_dt=0.01,
       sim_dt=0.002,
       episode_length=1000,
-      Kp=70.0,
-      Kd=1.0,
+      # Lite3 weighs 11.94 kg, the same class as Go1 (12.0 kg), which Playground
+      # runs at Kp=35/Kd=0.5. Aliengo's 70/1.0 is sized for 22 kg and would put
+      # Kp*action_scale = 35 N.m past the actuators' +-30 N.m ctrlrange.
+      Kp=35.0,
+      Kd=0.5,
       action_repeat=1,
       action_scale=0.5,
       history_len=1,
@@ -93,9 +96,17 @@ def default_config() -> config_dict.ConfigDict:
               feet_height=-0.2,
               feet_slip=-0.1,
               feet_air_time=0.1,
+              # Penalises a foot parked in the air. Without it a foot that
+              # never touches down costs nothing: feet_air_time and feet_height
+              # are only paid at first_contact, and feet_clearance is minimised
+              # by hovering at exactly max_foot_height.
+              feet_air_time_limit=-1.0,
           ),
           tracking_sigma=0.25,
           max_foot_height=0.1,
+          # A normal swing lasts 0.05-0.13 s; 0.5 s is ~4-10x that, so this
+          # only fires on a foot that has stopped stepping altogether.
+          max_air_time=0.5,
       ),
       pert_config=config_dict.create(
           enable=False,
@@ -620,6 +631,9 @@ class Joystick(lite3_base.Lite3Env):
         "feet_air_time": self._reward_feet_air_time(
             info["feet_air_time"], first_contact, info["command"]
         ),
+        "feet_air_time_limit": self._cost_feet_air_time_limit(
+            info["feet_air_time"], info["command"]
+        ),
         "dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
     }
 
@@ -738,6 +752,18 @@ class Joystick(lite3_base.Lite3Env):
     rew_air_time = jp.sum((air_time - 0.1) * first_contact)
     rew_air_time *= cmd_norm > 0.01  # No reward for zero commands.
     return rew_air_time
+
+  def _cost_feet_air_time_limit(
+      self, air_time: jax.Array, commands: jax.Array
+  ) -> jax.Array:
+    # Penalise air time beyond a normal swing, per foot and at every step.
+    # Unlike feet_air_time / feet_height, this does not wait for first_contact,
+    # so a foot that never touches down is charged continuously.
+    cmd_norm = jp.linalg.norm(commands)
+    excess = jp.clip(
+        air_time - self._config.reward_config.max_air_time, 0.0, None
+    )
+    return jp.sum(excess) * (cmd_norm > 0.01)
 
   # Perturbation and command sampling.
 

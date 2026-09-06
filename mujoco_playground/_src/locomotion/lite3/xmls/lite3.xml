@@ -28,10 +28,14 @@
               solref="0.005 1" friction="1 0.01 0.01"/>
       </default>
 
-      <!-- Feet: the only robot geoms that collide with the terrain. -->
+      <!-- Feet: the only robot geoms that collide with the terrain.
+           No priority/friction here on purpose: the scene floor has priority="1",
+           so its condim/friction govern the contact outright. Giving the foot the
+           same priority would make MuJoCo mix the two with max(), which silently
+           neutralises the floor-friction domain randomization below 0.6. -->
       <default class="foot">
-        <geom type="sphere" size="0.022" condim="3" contype="0" conaffinity="1" priority="1"
-              group="3" rgba="0.2 0.2 0.2 0.5" friction="0.6" solref="0.005 1"/>
+        <geom type="sphere" size="0.022" contype="0" conaffinity="1"
+              group="3" rgba="0.2 0.2 0.2 0.5"/>
       </default>
     </default>
   </default>
