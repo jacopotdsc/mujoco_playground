@@ -1,0 +1,16 @@
+<mujoco>
+  <sensor>
+    <contact name="FL_SHANK_collision_floor_found" geom1="FL_SHANK_collision" geom2="floor" reduce="mindist" num="1" data="found"/>
+    <contact name="FR_SHANK_collision_floor_found" geom1="FR_SHANK_collision" geom2="floor" reduce="mindist" num="1" data="found"/>
+    <contact name="HL_SHANK_collision_floor_found" geom1="HL_SHANK_collision" geom2="floor" reduce="mindist" num="1" data="found"/>
+    <contact name="HR_SHANK_collision_floor_found" geom1="HR_SHANK_collision" geom2="floor" reduce="mindist" num="1" data="found"/>
+    <contact name="FL_THIGH_collision_floor_found" geom1="FL_THIGH_collision" geom2="floor" reduce="mindist" num="1" data="found"/>
+    <contact name="FR_THIGH_collision_floor_found" geom1="FR_THIGH_collision" geom2="floor" reduce="mindist" num="1" data="found"/>
+    <contact name="HL_THIGH_collision_floor_found" geom1="HL_THIGH_collision" geom2="floor" reduce="mindist" num="1" data="found"/>
+    <contact name="HR_THIGH_collision_floor_found" geom1="HR_THIGH_collision" geom2="floor" reduce="mindist" num="1" data="found"/>
+    <contact name="FL_HIP_collision_floor_found" geom1="FL_HIP_collision" geom2="floor" reduce="mindist" num="1" data="found"/>
+    <contact name="FR_HIP_collision_floor_found" geom1="FR_HIP_collision" geom2="floor" reduce="mindist" num="1" data="found"/>
+    <contact name="HL_HIP_collision_floor_found" geom1="HL_HIP_collision" geom2="floor" reduce="mindist" num="1" data="found"/>
+    <contact name="HR_HIP_collision_floor_found" geom1="HR_HIP_collision" geom2="floor" reduce="mindist" num="1" data="found"/>
+  </sensor>
+</mujoco>

@@ -31,6 +31,9 @@ from mujoco_playground._src.locomotion.g1 import randomize as g1_randomize
 from mujoco_playground._src.locomotion.aliengo import joystick as aliengo_joystick
 from mujoco_playground._src.locomotion.aliengo import joystickE2E as aliengo_joystickE2E
 from mujoco_playground._src.locomotion.aliengo import randomize as aliengo_randomize
+from mujoco_playground._src.locomotion.lite3 import joystick as lite3_joystick
+from mujoco_playground._src.locomotion.lite3 import joystickE2E as lite3_joystickE2E
+from mujoco_playground._src.locomotion.lite3 import randomize as lite3_randomize
 from mujoco_playground._src.locomotion.tita import joystick as tita_joystick
 from mujoco_playground._src.locomotion.tita import joystickE2E as tita_joystickE2E
 from mujoco_playground._src.locomotion.tita import randomize as tita_randomize
@@ -79,6 +82,21 @@ _envs = {
     ),
     "AliengoJoystickPerlinTerrain": functools.partial(
         aliengo_joystick.Joystick, task="perlin_terrain"
+    ),
+    "Lite3JoystickFlatTerrain": functools.partial(
+        lite3_joystick.Joystick, task="flat_terrain"
+    ),
+    "Lite3JoystickE2EFlatTerrain": functools.partial(
+        lite3_joystickE2E.Joystick, task="flat_terrain"
+    ),
+    "Lite3JoystickRoughTerrain": functools.partial(
+        lite3_joystick.Joystick, task="rough_terrain"
+    ),
+    "Lite3JoystickStairsTerrain": functools.partial(
+        lite3_joystick.Joystick, task="stairs_terrain"
+    ),
+    "Lite3JoystickPerlinTerrain": functools.partial(
+        lite3_joystick.Joystick, task="perlin_terrain"
     ),
     "TitaJoystickFlatTerrain": functools.partial(
         tita_joystick.Joystick, task="flat_terrain"
@@ -138,6 +156,11 @@ _cfgs = {
     "AliengoJoystickStairsTerrain": aliengo_joystick.default_config,
     "AliengoJoystickE2EFlatTerrain": aliengo_joystickE2E.default_config,
     "AliengoJoystickPerlinTerrain": aliengo_joystick.default_config,
+    "Lite3JoystickFlatTerrain": lite3_joystick.default_config,
+    "Lite3JoystickE2EFlatTerrain": lite3_joystickE2E.default_config,
+    "Lite3JoystickRoughTerrain": lite3_joystick.default_config,
+    "Lite3JoystickStairsTerrain": lite3_joystick.default_config,
+    "Lite3JoystickPerlinTerrain": lite3_joystick.default_config,
     "TitaJoystickFlatTerrain": tita_joystick.default_config,
     "TitaJoystickE2EFlatTerrain": tita_joystickE2E.default_config,
     "TitaJoystickRoughTerrain": tita_joystick.default_config,
@@ -172,6 +195,11 @@ _randomizer = {
     "AliengoJoystickRoughTerrain": aliengo_randomize.domain_randomize,
     "AliengoJoystickStairsTerrain": aliengo_randomize.domain_randomize,
     "AliengoJoystickPerlinTerrain": aliengo_randomize.domain_randomize,
+    "Lite3JoystickFlatTerrain": lite3_randomize.domain_randomize,
+    "Lite3JoystickE2EFlatTerrain": lite3_randomize.domain_randomize,
+    "Lite3JoystickRoughTerrain": lite3_randomize.domain_randomize,
+    "Lite3JoystickStairsTerrain": lite3_randomize.domain_randomize,
+    "Lite3JoystickPerlinTerrain": lite3_randomize.domain_randomize,
     "TitaJoystickFlatTerrain": tita_randomize.domain_randomize,
     "TitaJoystickE2EFlatTerrain": tita_randomize.domain_randomize,
     "TitaJoystickRoughTerrain": tita_randomize.domain_randomize,

@@ -117,6 +117,22 @@ def brax_ppo_config(
         value_obs_key="privileged_state",
     )
   
+  elif env_name in (
+      "Lite3JoystickFlatTerrain",
+      "Lite3JoystickE2EFlatTerrain",
+  ):
+    rl_config.num_timesteps = 200_000_000
+    rl_config.num_evals = 20
+    rl_config.clipping_epsilon = 0.2
+    rl_config.num_resets_per_eval = 1
+    rl_config.entropy_cost = 0.005
+    rl_config.network_factory = config_dict.create(
+        policy_hidden_layer_sizes=(512, 256, 128),
+        value_hidden_layer_sizes=(512, 256, 128),
+        policy_obs_key="state",
+        value_obs_key="privileged_state",
+    )
+
   elif env_name in ("TitaJoystickFlatTerrain",):
     rl_config.num_timesteps = 200_000_000
     rl_config.num_evals = 20
@@ -242,6 +258,8 @@ def rsl_rl_config(
       "G1Joystick",
       "Go1JoystickFlatTerrain",
       "AliengoJoystickFlatTerrain",
+      "Lite3JoystickFlatTerrain",
+      "Lite3JoystickE2EFlatTerrain",
       "TitaJoystickFlatTerrain",
 
   ):
@@ -250,6 +268,9 @@ def rsl_rl_config(
     rl_config.algorithm.learning_rate = 3e-4
     rl_config.algorithm.schedule = "fixed"
   if env_name == "AliengoJoystickFlatTerrain":
+    rl_config.algorithm.learning_rate = 3e-4
+    rl_config.algorithm.schedule = "fixed"
+  if env_name in ("Lite3JoystickFlatTerrain", "Lite3JoystickE2EFlatTerrain"):
     rl_config.algorithm.learning_rate = 3e-4
     rl_config.algorithm.schedule = "fixed"
   if env_name == "TitaJoystickFlatTerrain":
