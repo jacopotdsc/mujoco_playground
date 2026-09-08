@@ -59,13 +59,33 @@ def default_config() -> config_dict.ConfigDict:
       ctrl_dt=0.01,
       sim_dt=0.002,
       episode_length=1000,
-      Kp=50.0,
-      Kd=1.0,
-      Kd_wheel=0.5,
+      # Nominal MPC/WBC outer PD: converts the WBC's solved joint accelerations
+      # into torque on top of the WBC feedforward. The target is recomputed every
+      # physics substep (500 Hz) from the current joint state and the held qddot,
+      # exactly like the validated standalone driver mjx_tita.py -- legs track the
+      # WBC plan position+velocity (Kp=35, Kd=10), wheels track the plan velocity
+      # (Kd_wheel=10). Refreshing at 500 Hz (not once per 10 ms control step) is
+      # what keeps the pure nominal controller stable.
+      Kp=35.0,
+      Kd=10.0,
+      Kd_wheel=10.0,
       action_repeat=1,
-      action_scale_pos=0.5, # prova 0.3
-      action_scale_vel=25.0, # prova 15.0
-      soft_joint_pos_limit_factor=0.95, 
+      # Residual RL scales: leg position offset (rad) and wheel velocity target
+      # (rad/s), applied to the clipped policy action about the DEFAULT pose.
+      action_scale_pos=0.5,
+      action_scale_vel=25.0,
+      soft_joint_pos_limit_factor=0.95,
+      # Residual RL torque channel, added on top of the nominal torque:
+      #   tau_total = clip(tau_nominal + scale * tau_residual, actuator_limits)
+      residual_config=config_dict.create(
+          enabled=True,          # False -> pure MPC/WBC (residual torque = 0)
+          scale=0.5,             # blend factor lambda on the residual torque
+          Kp=20.0,               # residual leg PD proportional gain
+          Kd=0.5,                # residual leg PD derivative gain
+          Kd_wheel=0.5,          # residual wheel velocity gain
+          tau_limit_leg=25.0,    # residual torque clip on legs [N m]
+          tau_limit_wheel=12.5,  # residual torque clip on wheels [N m]
+      ),
       noise_config=config_dict.create(
           level=0.0,
           scales=config_dict.create(
@@ -76,27 +96,35 @@ def default_config() -> config_dict.ConfigDict:
               linvel=0.1,
           ),
       ),
+      # Minimal, paper-aligned reward set (Residual MPC / Energy-Efficient /
+      # Non-Gaited papers): command tracking + stability + a residual-magnitude
+      # penalty that keeps the residual small when the nominal suffices. Contact
+      # scheduling, feasibility and joint/torque limits are left to MPC/WBC.
       reward_config=config_dict.create(
           scales=config_dict.create(
+              # Command tracking (command-normalized exp kernel). Weights kept at
+              # the training-stable scale (run 2); the normalization — not a
+              # weight increase — is what supplies the extension gradient.
               tracking_lin_vel=1.0,
               tracking_ang_vel=0.5,
-              tracking_mpc_accel=0.0,
-              tracking_mpc_alpha=0.0,
+              # Stability / recovery: keep the base upright and at height.
               orientation=-1.0,
-              ang_vel_xy=-0.3,
               base_height=-1.0,
-              posture=-1.0,      # command-gated; see _cost_posture
-              torques=-1e-4,
+              # Residual regularity: a weak penalty on the residual action. Kept
+              # weak on purpose -- because the residual target starts from the
+              # default pose, the non-interfering action is NOT zero, so a strong
+              # ||action|| penalty would push toward the zero-action overshoot and
+              # HURT preservation. The tracking reward sets the action magnitude.
+              residual=-0.1,
               action_rate=-0.01,
+              # Safety: leg joint soft-limit hinge.
               dof_pos_limits=-1.0,
-              dof_vel=-0.0,
+              # Failure.
               termination=-100.0,
           ),
           only_positive_rewards=False,
           tracking_sigma=0.0625,
-          mpc_tracking_sigma=0.0625,
-          base_height_target=0.4, 
-          posture_cmd_sigma=0.25,     # gate width: posture relaxes as |command| grows
+          base_height_target=0.4,
       ),
       pert_config=config_dict.create(
           enable=False,
@@ -105,8 +133,22 @@ def default_config() -> config_dict.ConfigDict:
           kick_wait_times=[1.0, 3.0],
       ),
       # Command = [forward_vel (m/s), yaw_rate (rad/s)].
+      # vx range reaches into the extension region (the nominal MPC/WBC tracks
+      # to ~1.5 m/s and falls at >=2.0), so the residual policy is exposed to
+      # commands only it can satisfy. yaw range covers the full nominal envelope.
       command_config=config_dict.create(
-          a=[1.0, 0.5],     # amplitude (uniform half-range) per command
+          # RAMP protocol (train == eval == deploy): the applied command
+          # low-pass-tracks the target with gain command_lpf. Under a ramp the
+          # nominal MPC/WBC reaches ~3.0-3.5 m/s (vs ~1.5 under a step), so the
+          # command range is set toward that ramp limit: the residual learns
+          # where the nominal actually struggles (~2.5-3.5).
+          command_lpf=0.02,       # 0.02 = ramp (train/eval/deploy); 1.0 = instant step
+          a=[2.0, 0.8],           # full command half-range: vx +-2.0, wz +-0.8 (B's proven range)
+          a_learned=[1.5, 0.6],   # survivable inner range
+          p_extend=0.3,           # ~70% of commands in [-a_learned, a_learned], ~30% in
+                                  # the extension band [a_learned, a] (either sign), so
+                                  # most episodes are survivable (strong, stable signal)
+                                  # while the residual still practices the hard region.
           b=[0.75, 0.75],    # prob a resampled command stays non-zero
           h=[0.4, 0.4],    # CoM height command range [min, max] [m]
       ),
@@ -175,6 +217,8 @@ class Joystick(tita_base.TitaEnv):
     self._base_com_adr = self._sensor_adr("base_subtree_com")
 
     self._cmd_a = jp.array(self._config.command_config.a)
+    self._cmd_a_learned = jp.array(self._config.command_config.a_learned)
+    self._cmd_p_extend = float(self._config.command_config.p_extend)
     self._cmd_b = jp.array(self._config.command_config.b)
     self._cmd_h = jp.array(self._config.command_config.h)
     self._cmd_resample_scale = 0.5 * self._config.episode_length * self.dt
@@ -260,32 +304,50 @@ class Joystick(tita_base.TitaEnv):
     return x0, theta
 
   def _joint_targets_from_qddot(self, qpos_joint, qvel_joint, qddot):
-    """Desired joint pos/vel = current state integrated forward with the WBC's
-    solved joint accelerations. qddot is (1, nv) from the vmapped solver
-    (batch dim kept, unlike mpc_tau): [:, :6] is the floating base, [:, 6:] the
-    nj actuated joints in qpos[7:]/qvel[6:] order."""
+    """NOMINAL joint targets: current joint state integrated one simulation step
+    with the WBC's solved joint accelerations. Used ONLY for the nominal MPC/WBC
+    outer PD -- never for the residual policy target. qddot is (1, nv) from the
+    vmapped solver: [:, :6] is the floating base, [:, 6:] the nj actuated joints
+    in qpos[7:]/qvel[6:] order."""
     dt = self._config.sim_dt
     qddot_joint = qddot[0, 6:]
     dq_target = qvel_joint + qddot_joint * dt
     q_target = qpos_joint + qvel_joint * dt + 0.5 * qddot_joint * dt**2
     return q_target, dq_target
 
-  def _compute_joint_desired(self, action, qpos_joint, qvel_joint, qddot):
-    # NOTE: this previously used a fixed q_target = self._default_pose,
-    # decoupling the residual policy's PD target from the MPC/WBC's own
-    # planned trajectory -- the only historically-converged residual run
-    # (checkpoints/TitaJoystickFlatTerrain/saved/first_training_residual)
-    # used the qddot-integrated target below. With a fixed default-pose
-    # target, "residual" only means "torque summed with an RL-blind WBC
-    # torque"; restoring this makes the policy's PD target track what the
-    # WBC actually planned for this step, which is what "residual on top
-    # of the controller's plan" is supposed to mean.
-    q_target, dq_target = self._joint_targets_from_qddot(qpos_joint, qvel_joint, qddot)
+  def _residual_joint_targets(self, action):
+    """RESIDUAL RL targets, built from the DEFAULT pose ONLY (hard requirement:
+    never from the WBC plan / q_des_wbc / qddot integration). Legs: position
+    offset about the default pose; wheels: velocity target. `action` is the
+    clipped policy output in [-1, 1]. This function does not read the WBC plan,
+    the current joint state, or any MPC quantity -- only the constant default
+    pose and the action, so the residual target cannot drift or depend on the
+    nominal controller."""
+    q_des_rl = self._default_pose + action * self._config.action_scale_pos
+    dq_des_rl = action * self._config.action_scale_vel
+    return q_des_rl, dq_des_rl
 
-    q_des = q_target + action * self._config.action_scale_pos
-    dq_des = dq_target + action * self._config.action_scale_vel
+  def _combine_torque(self, q, qd, tau_ff, q_des_wbc, dq_des_wbc, q_des_rl, dq_des_rl, residual_gate):
+    rc = self._config.residual_config
 
-    return q_des, dq_des
+    # Nominal MPC/WBC torque 
+    tau_nom_leg   = self._config.Kp * (q_des_wbc - q) + self._config.Kd * (dq_des_wbc - qd)
+    tau_nom_wheel = self._config.Kd_wheel * (dq_des_wbc - qd)
+    ctrl_nom = jp.zeros(self.mjx_model.nu)
+    ctrl_nom = ctrl_nom.at[self._leg_ids].set(tau_nom_leg[self._leg_ids])
+    ctrl_nom = ctrl_nom.at[self._wheel_ids].set(tau_nom_wheel[self._wheel_ids])
+    tau_nominal = ctrl_nom + tau_ff
+
+    # Residual RL torque, clipped to the residual limit.
+    tau_res_leg   = rc.Kp * (q_des_rl - q) - rc.Kd * qd
+    tau_res_wheel = rc.Kd_wheel * (dq_des_rl - qd)
+    tau_res = jp.zeros(self.mjx_model.nu)
+    tau_res = tau_res.at[self._leg_ids].set(jp.clip(tau_res_leg[self._leg_ids], -rc.tau_limit_leg, rc.tau_limit_leg))
+    tau_res = tau_res.at[self._wheel_ids].set(jp.clip(tau_res_wheel[self._wheel_ids], -rc.tau_limit_wheel, rc.tau_limit_wheel))
+    tau_rl = residual_gate * tau_res
+    
+    tau_total = jp.clip(tau_nominal + tau_rl, -self._torque_limits, self._torque_limits)
+    return tau_nominal, tau_rl, tau_total
 
   # --------------------------------------------------------------------
   # Reset / step.
@@ -371,7 +433,7 @@ class Joystick(tita_base.TitaEnv):
     # The command fed to the MPC starts at zero (matches info["command"]).
     # ------------------------------------------------------------------
     mpc_state = self.mpc.init_state()
-    mpc_state, tita_state, dfcip_state, mpc_tau, mpc_qddot, mpc_fl, mpc_fr, desired, theta_prev, mpc_reference = self._run_mpc_wbc(
+    mpc_state, tita_state, dfcip_state, mpc_tau, mpc_qddot, mpc_fl, mpc_fr, desired, theta_prev, mpc_reference, _solver_bad = self._run_mpc_wbc(
         data=data,
         qpos=data.qpos,
         qvel=data.qvel,
@@ -383,12 +445,8 @@ class Joystick(tita_base.TitaEnv):
         timestep=0
         )
 
-    q_des, dq_des = self._compute_joint_desired(
-        action=jp.zeros(self.mjx_model.nu),
-        qpos_joint=data.qpos[7:],
-        qvel_joint=data.qvel[6:],
-        qddot=mpc_qddot,
-    )
+    # Residual targets at reset (zero action) -> exactly the default pose.
+    q_des, dq_des = self._residual_joint_targets(jp.zeros(self.mjx_model.nu))
 
     info = {
         "rng": rng,
@@ -452,8 +510,16 @@ class Joystick(tita_base.TitaEnv):
         "mpc_control_last": mpc_reference[0][0, 13:],  # previous-step u_ref, for delta obs (0 on reset)
         # WBC desired vector (com/wheel/base/joint refs); obs slices out q/wheel-vel desired.
         "mpc_desired": desired[0],
-        "joint_pos_des": q_des,  # desired leg joint positions (integrated from WBC qddot)
-        "wheel_vel_des": dq_des,  # desired wheel velocities (integrated from WBC qddot)
+        "joint_pos_des": q_des,  # residual RL leg targets (default pose + action)
+        "wheel_vel_des": dq_des,  # residual RL wheel velocity targets (action)
+        # Per-step torque diagnostics (logged only; set every step()).
+        "tau_nominal": jp.zeros(self.mjx_model.nu),
+        "tau_residual": jp.zeros(self.mjx_model.nu),
+        "tau_total": jp.zeros(self.mjx_model.nu),
+        "tau_saturated_frac": jp.zeros(()),
+        "mpc_bad": jp.zeros(()),                      # 1.0 if the MPC/WBC solve failed this step
+        "mpc_fallback_count": jp.zeros((), dtype=jp.int32),  # cumulative solver failures
+        "nonfinite_count": jp.zeros((), dtype=jp.int32),     # cumulative non-finite physics states
         "reward_terms" : {}
     }
 
@@ -516,15 +582,30 @@ class Joystick(tita_base.TitaEnv):
         use_nn=False
     )
 
+    # Detect a genuine solver failure BEFORE masking with nan_to_num (Section 17).
+    # Only the APPLIED outputs are checked: tau/qddot (applied torque), x0 (obs)
+    # and the reference (obs). The mpc_state warm-start is NOT checked -- its
+    # D0_shifted (FDDP shooting defects) is non-finite by design at unused nodes,
+    # so checking the whole pytree would fire the fallback every step and freeze
+    # the controller (the standalone driver threads the same state and never
+    # checks it).
+    solver_bad = (
+        jp.any(~jp.isfinite(tau))
+        | jp.any(~jp.isfinite(qddot))
+        | jp.any(~jp.isfinite(x0))
+        | jp.any(~jp.isfinite(reference))
+    )
     tau = jp.nan_to_num(tau[0], nan=0.0, posinf=0.0, neginf=0.0)
     qddot = jp.nan_to_num(qddot, nan=0.0, posinf=0.0, neginf=0.0)
-    return mpc_state, tita_state, x0, tau, qddot, fl, fr, desired, theta_prev, reference
+    return mpc_state, tita_state, x0, tau, qddot, fl, fr, desired, theta_prev, reference, solver_bad
 
   def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
     if self._config.pert_config.enable:
       state = self._maybe_apply_perturbation(state)
-    
-    new_mpc_state, tita_state, dfcip_state, new_tau, new_qddot, mpc_fl, mpc_fr, desired, theta_prev, mpc_reference = self._run_mpc_wbc(
+
+    action = jp.clip(action, -1.0, 1.0)
+
+    new_mpc_state, tita_state, dfcip_state, new_tau, new_qddot, mpc_fl, mpc_fr, desired, theta_prev, mpc_reference, solver_bad = self._run_mpc_wbc(
         data=state.data,
         qpos=state.data.qpos,
         qvel=state.data.qvel,
@@ -535,12 +616,12 @@ class Joystick(tita_base.TitaEnv):
         theta_prev=state.info["theta_prev"],
         timestep=state.info["step"]
     )
-        
-    bad = (
-        _tree_has_nonfinite(new_mpc_state)
-        | jp.any(~jp.isfinite(new_tau))
-        | jp.any(~jp.isfinite(new_qddot))
-    )
+
+    bad = solver_bad
+    state.info["mpc_bad"] = bad.astype(state.info["mpc_bad"].dtype)
+    state.info["mpc_fallback_count"] = (
+        state.info["mpc_fallback_count"]
+        + bad.astype(state.info["mpc_fallback_count"].dtype))
     mpc_state = jax.tree_util.tree_map(
         lambda new, old: jp.where(bad, old, new),
         new_mpc_state,
@@ -565,48 +646,39 @@ class Joystick(tita_base.TitaEnv):
     state.info["mpc_control"]   = mpc_reference[0][0, 13:]
     state.info["mpc_desired"]   = desired[0]
 
-    #q_des = self._default_pose + action * self._config.action_scale_pos
-    #v_des = action * self._config.action_scale_vel
+    # Residual RL target from the DEFAULT pose (never the WBC plan). Constant
+    # across the substep loop (does not depend on the evolving joint state).
+    q_des_rl, dq_des_rl = self._residual_joint_targets(action)
 
-    # Computed here (pre-substep qpos/qvel, same instant as the qddot above),
-    # written to state.info only after the substep loop below.
-
-    q_des, dq_des = self._compute_joint_desired(
-        action=action,
-        qpos_joint=state.data.qpos[7:],
-        qvel_joint=state.data.qvel[6:],
-        qddot=qddot,
-    )
+    rc = self._config.residual_config
+    residual_gate = rc.scale * (1.0 if rc.enabled else 0.0)
 
     def substep_fn(data, _):
         q  = data.qpos[7:]
         qd = data.qvel[6:]
-
-        #q_des, dq_des = self._compute_joint_desired(
-        #    action=action,
-        #    qpos_joint=state.data.qpos[7:],
-        #    qvel_joint=state.data.qvel[6:],
-        #    qddot=qddot,
-        #)
-
-        tau_leg   = self._config.Kp * (q_des - q) - self._config.Kd * qd
-        tau_wheel = self._config.Kd_wheel * (dq_des - qd)
-
-        ctrl_nn = jp.zeros(self.mjx_model.nu)
-        ctrl_nn = ctrl_nn.at[self._leg_ids].set(tau_leg[self._leg_ids])
-        ctrl_nn = ctrl_nn.at[self._wheel_ids].set(tau_wheel[self._wheel_ids])
-
-        ctrl = ctrl_nn + tau
-
+        # Refresh the nominal outer-PD target every substep (500 Hz) from the
+        # current joint state and the held WBC qddot, matching the standalone.
+        q_des_wbc, dq_des_wbc = self._joint_targets_from_qddot(q, qd, qddot)
+        tau_nom, tau_rl, ctrl = self._combine_torque(q, qd, tau, q_des_wbc, dq_des_wbc, q_des_rl, dq_des_rl, residual_gate)
         data = data.replace(ctrl=ctrl)
         data = mjx.step(self.mjx_model, data)
-        return data, None
+        return data, (tau_nom, tau_rl, ctrl)
 
-    data, _ = jax.lax.scan(substep_fn, state.data, xs=None, length=self.n_substeps)
+    data, (tau_nom_s, tau_rl_s, tau_tot_s) = jax.lax.scan(
+        substep_fn, state.data, xs=None, length=self.n_substeps)
     state = state.replace(data=data)
 
-    state.info["joint_pos_des"] = q_des
-    state.info["wheel_vel_des"] = dq_des
+    # Torque diagnostics from the last substep (logged only; no separate subgraph).
+    tau_nom_d, tau_rl_d, tau_tot_d = tau_nom_s[-1], tau_rl_s[-1], tau_tot_s[-1]
+    saturated = jp.abs(tau_tot_d) >= (self._torque_limits - 1e-3)
+    state.info["tau_nominal"] = tau_nom_d
+    state.info["tau_residual"] = tau_rl_d
+    state.info["tau_total"] = tau_tot_d
+    state.info["tau_saturated_frac"] = jp.mean(
+        saturated.astype(state.info["tau_saturated_frac"].dtype))
+
+    state.info["joint_pos_des"] = q_des_rl
+    state.info["wheel_vel_des"] = dq_des_rl
 
     # Foot contact bookkeeping (kept for eval/plotting).
     contact = jp.array([
@@ -669,6 +741,28 @@ class Joystick(tita_base.TitaEnv):
     else:
       reward = jp.clip(sum(rewards.values()) * self.dt, -10000.0, 10000.0)
 
+    # NaN-robustness (Section 17): a diverged physics state (hard fall / blow-up)
+    # must terminate the episode with a finite penalty and must NEVER leak NaN
+    # into the observation or the reward, or it poisons the PPO update. Detect
+    # BEFORE sanitising with nan_to_num, and count it.
+    finite = (
+        jp.all(jp.isfinite(data.qpos))
+        & jp.all(jp.isfinite(data.qvel))
+        & jp.all(jp.isfinite(obs["state"]))
+        & jp.all(jp.isfinite(obs["privileged_state"]))
+        & jp.isfinite(reward)
+    )
+    done = jp.logical_or(done, ~finite)
+    # Penalty commensurate with a normal termination (the termination term is
+    # -100 * dt = -1.0 in the summed reward). A large raw -100 here would dwarf
+    # the ~0.01/step normal reward and blow up the value target variance -> NaN.
+    reward = jp.where(finite, reward, -1.0)
+    obs = jax.tree_util.tree_map(
+        lambda x: jp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), obs)
+    state.info["nonfinite_count"] = (
+        state.info["nonfinite_count"]
+        + (~finite).astype(state.info["nonfinite_count"].dtype))
+
     state.info["reward_terms"] = rewards
 
     for k, v in rewards.items():
@@ -697,9 +791,11 @@ class Joystick(tita_base.TitaEnv):
         self.sample_command(key1, state.info["target_command"]),
         state.info["target_command"],
     )
+    
+    lpf = self._config.command_config.command_lpf
     state.info["command"] = (
         state.info["command"]
-        + 0.02 * (state.info["target_command"] - state.info["command"])
+        + lpf * (state.info["target_command"] - state.info["command"])
     )
     state.info["steps_until_next_cmd"] = jp.where(
         (state.info["steps_until_next_cmd"] <= 0),
@@ -804,19 +900,12 @@ class Joystick(tita_base.TitaEnv):
     mpc_control_a = mpc_control[0:1]     #- mpc_control_last[0:1]   # CoM forward acceleration delta
     mpc_control_acz = mpc_control[1:2]   #- mpc_control_last[1:2]   # CoM vertical acceleration delta
     mpc_control_alpha = mpc_control[2:3] #- mpc_control_last[2:3]   # angular acceleration delta
-    #half_weight = config.mass * config.grav / 2.0  # nominal static load per wheel (~27 kg robot)
-    mpc_control_fl = mpc_control[3:6] #/ half_weight    #- mpc_control_last[3:6]   # left contact-point force delta
-    mpc_control_fr = mpc_control[6:9] #/ half_weight    #- mpc_control_last[6:9]   # right contact-point force delta
-
-    # Computed in step() (pre-substep qpos/qvel + WBC qddot); see _joint_targets_from_qddot.
-    joint_pos_des = info["joint_pos_des"]           # 6   desired leg joint positions
-    wheel_vel_des = info["wheel_vel_des"]           # 2   desired wheel velocities
-
-    q_target, dq_target = self._joint_targets_from_qddot(
-        qpos_joint=joint_angles,
-        qvel_joint=joint_vel,
-        qddot=info["mpc_qddot"],
-    )
+    # Normalize the contact forces by the nominal static load per wheel
+    # (m*g/2 ~= 136 N) so they enter the observation at ~O(1) instead of ~136,
+    # keeping the observation well scaled.
+    half_weight = config.mass * config.grav / 2.0  # ~135.8 N per wheel
+    mpc_control_fl = mpc_control[3:6] / half_weight    # left contact-point force / (m g / 2)
+    mpc_control_fr = mpc_control[6:9] / half_weight    # right contact-point force / (m g / 2)
 
     state = jp.hstack([
         noisy_linvel,        # 3   local linear velocity
@@ -882,36 +971,41 @@ class Joystick(tita_base.TitaEnv):
     command = info["command"]
     body_height = data.sensordata[self._base_com_adr][2]
     return {
-        # Task tracking (raw error -> Gaussian kernel).
+        # Command tracking (raw error -> Gaussian kernel).
         "tracking_lin_vel": self._reward_tracking_lin_vel(
             command, self.get_local_linvel(data)),
         "tracking_ang_vel": self._reward_tracking_ang_vel(
             command, self.get_gyro(data)),
-        "tracking_mpc_accel": self._reward_mpc_accel(data, info),
-        "tracking_mpc_alpha": self._reward_mpc_alpha(data, info),
-        # Balance / body configuration.
+        # Stability / recovery.
         "orientation": self._cost_orientation(data),
-        "ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
         "base_height": self._cost_height(body_height, info["base_height_target"]),
-        "posture": self._cost_posture(data.qpos[7:], command),
-        # Effort / smoothness / safety.
-        "torques": self._cost_torques(data.actuator_force),
+        # Residual regularity + smoothness.
+        "residual": self._cost_residual(action),
         "action_rate": self._cost_action_rate(action, info["last_act"]),
+        # Safety + failure.
         "dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
-        "dof_vel": self._cost_dof_vel(data.qvel[6:], command),
         "termination": self._cost_termination(done),
     }
+
+  def _cost_residual(self, action: jax.Array) -> jax.Array:
+    # Weak residual-magnitude penalty (paper-aligned). Discourages chattering /
+    # gratuitously large residuals without forcing the action to zero (which,
+    # under the default-pose target, would be the zero-action overshoot).
+    return jp.sum(jp.square(action))
 
   def _reward_tracking_lin_vel(
       self, command: jax.Array, local_vel: jax.Array
   ) -> jax.Array:
-    err = jp.square(command[0] - local_vel[0])
+    # Command-normalized error (Residual-MPC paper): dividing by (1+|cmd|) keeps
+    # the Gaussian kernel from saturating to ~0 at large commands, so the policy
+    # still gets a tracking gradient in the extension region (vx > 1.5).
+    err = jp.square((command[0] - local_vel[0]) / (1.0 + jp.abs(command[0])))
     return jp.exp(-err / self._config.reward_config.tracking_sigma)
 
   def _reward_tracking_ang_vel(
       self, command: jax.Array, gyro: jax.Array
   ) -> jax.Array:
-    err = jp.square(command[1] - gyro[2])
+    err = jp.square((command[1] - gyro[2]) / (1.0 + jp.abs(command[1])))
     return jp.exp(-err / self._config.reward_config.tracking_sigma)
   
   # in _post_init / config:  mpc_tracking_sigma = 0.5   (adimensionale, come tracking_sigma)
@@ -997,11 +1091,17 @@ class Joystick(tita_base.TitaEnv):
   # --------------------------------------------------------------------
 
   def sample_command(self, rng: jax.Array, x_k: jax.Array) -> jax.Array:
-    rng, y_rng, w_rng, z_rng = jax.random.split(rng, 4)
+    rng, in_rng, band_rng, sign_rng, ext_rng, w_rng, z_rng = jax.random.split(rng, 7)
     cmd_shape = self._cmd_a.shape[0]
-    y_k = jax.random.uniform(
-        y_rng, shape=(cmd_shape,), minval=-self._cmd_a, maxval=self._cmd_a
-    )
+    # Stratified magnitude: majority in the survivable inner range, a minority in
+    # the extension band [a_learned, a] with random sign.
+    inner = jax.random.uniform(
+        in_rng, (cmd_shape,), minval=-self._cmd_a_learned, maxval=self._cmd_a_learned)
+    band = jax.random.uniform(
+        band_rng, (cmd_shape,), minval=self._cmd_a_learned, maxval=self._cmd_a)
+    sign = jp.where(jax.random.bernoulli(sign_rng, 0.5, (cmd_shape,)), 1.0, -1.0)
+    is_ext = jax.random.bernoulli(ext_rng, self._cmd_p_extend, (cmd_shape,))
+    y_k = jp.where(is_ext, sign * band, inner)
     z_k = jax.random.bernoulli(z_rng, self._cmd_b, shape=(cmd_shape,))
     w_k = jax.random.bernoulli(w_rng, 0.5, shape=(cmd_shape,))
     x_kp1 = x_k - w_k * (x_k - y_k * z_k)
