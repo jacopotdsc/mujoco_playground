@@ -92,6 +92,7 @@ def default_config() -> config_dict.ConfigDict:
           b=[0.75, 0.75],    # prob a resampled command stays non-zero
           h=[0.4, 0.4],    # CoM height command range [min, max] [m]
           p_stand=0.2,      # prob of an explicit zero (standing) command
+          names=["vx", "wz"]
       ),
       impl="jax",
       naconmax=4 * 8192,

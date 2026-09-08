@@ -28,19 +28,26 @@ from mujoco_playground._src import mjx_env
 from mujoco_playground._src.locomotion.lite3 import base as lite3_base
 from mujoco_playground._src.locomotion.lite3 import lite3_constants as consts
 
-import mpx.config.config_srbd as config
+import mpx.config.config_lite3 as config
 from mpx.utils.mpc_wrapper_srbd import BatchedMPCControllerWrapper
 import mpx.utils.sim as sim_utils
 
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
+      # Same rates as the validated standalone lite3_srbd.py:
+      # MPC 50 Hz, whole-body controller 200 Hz, 4 substeps per control step.
       ctrl_dt=0.02,
-      sim_dt=0.004,
+      sim_dt=0.005,
       episode_length=1000,
-      Kp=60.0,
+      Kp=35.0,
       Kd=0.5,
+      # Residual torque budget, in N.m, for an action of magnitude 1. The
+      # validated MPC baseline runs at 3.5 N.m rms with an 18.1 N.m peak against
+      # a +-30 N.m limit, so 6.0 N.m is ~1.7x the baseline rms and still leaves
+      # 18.1 + 6.0 = 24.1 N.m, i.e. no saturation even in the worst scenario.
+      residual_torque_scale=6.0,
       action_repeat=1,
-      action_scale=0.25,
+      action_scale=0.5,
       history_len=1,
       soft_joint_pos_limit_factor=0.95,
       noise_config=config_dict.create(
@@ -53,33 +60,36 @@ def default_config() -> config_dict.ConfigDict:
               linvel=0.1,
           ),
       ),
+      # Reward set for the residual task. The MPC already schedules the gait, so
+      # the gait-shaping terms of the E2E environment (feet_air_time,
+      # feet_height, feet_clearance, feet_slip) are deliberately absent: the
+      # Residual-MPC paper reports that paying the policy for gait-shaped
+      # behaviour on top of an MPC prior is redundant, and in the Lite3 E2E
+      # environment those same terms produced a three-legged gait.
       reward_config=config_dict.create(
           scales=config_dict.create(
-              # Tracking.
+              # Tracking. The policy's whole job is to beat the MPC here.
               tracking_lin_vel=1.0,
               tracking_ang_vel=0.5,
-              # Base reward.
+              # Posture.
+              orientation=-5.0,
               lin_vel_z=-0.5,
               ang_vel_xy=-0.05,
-              orientation=-5.0,
-              # Other.
-              dof_pos_limits=-1.0,
               pose=0.5,
-              # Other.
-              termination=-1.0,
-              stand_still=-1.0,
-              # Regularization.
-              torques=-0.0002,
+              dof_pos_limits=-1.0,
+              # Survival. Kept an order of magnitude above the tracking terms so
+              # that falling is never worth it.
+              termination=-10.0,
+              # Residual regularization: stay near the baseline unless it pays.
+              residual_torque=-0.02,
+              residual_saturation=-0.5,
               action_rate=-0.01,
+              action_accel=-0.001,
+              # Effort.
+              torques=-0.0002,
               energy=-0.001,
-              # Feet.
-              feet_clearance=-2.0,
-              feet_height=-0.2,
-              feet_slip=-0.1,
-              feet_air_time=0.1,
           ),
           tracking_sigma=0.25,
-          max_foot_height=0.1,
       ),
       pert_config=config_dict.create(
           enable=False,
@@ -89,9 +99,17 @@ def default_config() -> config_dict.ConfigDict:
       ),
       command_config=config_dict.create(
           # Uniform distribution for command amplitude.
-          a=[1.5, 0.0, 1.2],
+          # Deliberately wider than what the nominal MPC can survive. Measured
+          # envelope of the baseline on lite3_srbd.py: vx tracked to 0.6 and
+          # diverging at 0.9 (216 N.m, 22% saturated, falls), vy fine at 0.4,
+          # wz clean to 1.2. Commands beyond that make the MPC fall on its own,
+          # and extending that envelope is precisely what the residual is for --
+          # the Residual-MPC paper reports +78% in vx over its MPC baseline.
+          # Episodes terminate on a fall, so divergence is cut short.
+          a=[1.5, 0.6, 1.2],
           # Probability of not zeroing out new command.
           b=[0.9, 0.25, 0.5],
+          names=["vx", "vy", "wz"]
       ),
       impl="jax",
       naconmax=4 * 8192,
@@ -179,6 +197,10 @@ class Joystick(lite3_base.Lite3Env):
     # base.__init__ called mjx.put_model before this _post_init ran, so the
     # compiled mjx_model had stale condim/contype/conaffinity values which
     # caused shape mismatches in mjx contact solvers.
+    # Actuator torque limits, read from the model rather than hardcoded.
+    self._tau_min = jp.array(self._mj_model.actuator_ctrlrange[:, 0])
+    self._tau_max = jp.array(self._mj_model.actuator_ctrlrange[:, 1])
+
     self._mjx_model = mjx.put_model(self._mj_model, impl=self._config.impl)
 
   def reset(self, rng: jax.Array) -> mjx_env.State:
@@ -272,17 +294,11 @@ class Joystick(lite3_base.Lite3Env):
         #"mpc_obs": mpc_obs,
         "mpc_tau": tau,
         "low_level_controller": {
-            #"tau_ff":      jp.zeros(self.mjx_model.nu),
-            "q_des":       jp.zeros(self.mjx_model.nu),
-            "dq_des":      jp.zeros(self.mjx_model.nu),
-            "qacc_joints": jp.zeros(self.mjx_model.nu),
-            "tau_p":       jp.zeros(self.mjx_model.nu),
-            "tau_d":       jp.zeros(self.mjx_model.nu),
-            "kp":          jp.zeros(()),
-            "kd":          jp.zeros(()),
-            "action_scale": jp.zeros(()),
-            "action":      jp.zeros(self.mjx_model.nu),
-            "qpos":        jp.zeros(self.mjx_model.nq),
+            "tau_mpc": jp.zeros(self.mjx_model.nu),
+            "tau_rl": jp.zeros(self.mjx_model.nu),
+            "tau_final": jp.zeros(self.mjx_model.nu),
+            "saturated": jp.zeros(self.mjx_model.nu),
+            "action": jp.zeros(self.mjx_model.nu),
         },
         "reward_terms" : {}
     }
@@ -399,37 +415,23 @@ class Joystick(lite3_base.Lite3Env):
     state.info["mpc_state"] = mpc_state
 
     def substep_fn(data, _):
-        tau_ff, J = self._whole_body_ctrl(data.qpos, data.qvel, mpc_state)
-        #grf = mpc_state.grf[0]
-
-        #q_des, dq_des, qacc_joints = self.tau_to_qdes(data, tau_ff, grf, J, self.sim_dt)
-        #jax.debug.print("q_des has nan: {}", jp.any(jp.isnan(q_des)))
-        #q_des  = jax.lax.stop_gradient(q_des)
-        #dq_des = jax.lax.stop_gradient(dq_des)
-        #qacc_joints = jax.lax.stop_gradient(qacc_joints)
+        tau_mpc, _ = self._whole_body_ctrl(data.qpos, data.qvel, mpc_state)
         
-        #jax.debug.print("nn action: {action}", action=action)
         tau_p = self._config.Kp * ( self._default_pose + action*self._config.action_scale - data.qpos[7:])
         tau_d = self._config.Kd * ( - data.qvel[6:])
-        tau_pd = tau_p + tau_d
-        #tau_pd = self._config.Kp * ( q_des - data.qpos[7:]) + self._config.Kd * (dq_des - data.qvel[6:])
+        tau_rl = tau_p + tau_d
         
-        motor_targets = tau_ff + tau_pd 
+        tau_final = tau_mpc + tau_rl
+        tau_final = jp.clip(tau_final, self._tau_min, self._tau_max)
 
-        data = data.replace(ctrl=motor_targets)
+        data = data.replace(ctrl=tau_final)
         data = mjx.step(self.mjx_model, data)
         llc_log = {
-            #"tau_ff":      tau_ff,
-            "q_des":       jp.zeros_like(data.qpos[7:]),  # q_des,
-            "dq_des":      jp.zeros_like(data.qvel[6:]),  # dq_des,
-            "qacc_joints": jp.zeros_like(data.qvel[6:]),  # qacc_joints,
-            "tau_p":       tau_p,
-            "tau_d":       tau_d,
-            "kp":          jp.array(self._config.Kp),
-            "kd":          jp.array(self._config.Kd),
-            "action_scale": jp.array(self._config.action_scale),
-            "action":      action,
-            "qpos":        data.qpos,
+            "tau_mpc": tau_mpc,
+            "tau_rl": tau_rl,
+            "tau_final": tau_final,
+            "saturated": (jp.abs(tau_final) >= self._tau_max - 1e-6).astype(tau_final.dtype),
+            "action": action,
         }
         return data, llc_log
 
@@ -604,7 +606,8 @@ class Joystick(lite3_base.Lite3Env):
       first_contact: jax.Array,
       contact: jax.Array,
   ) -> dict[str, jax.Array]:
-    del metrics  # Unused.
+    del metrics, first_contact, contact  # Unused: the MPC schedules the gait.
+    llc = info["low_level_controller"]
     return {
         "tracking_lin_vel": self._reward_tracking_lin_vel(
             info["command"], self.get_local_linvel(data)
@@ -612,27 +615,33 @@ class Joystick(lite3_base.Lite3Env):
         "tracking_ang_vel": self._reward_tracking_ang_vel(
             info["command"], self.get_gyro(data)
         ),
+        "orientation": self._cost_orientation(self.get_upvector(data)),
         "lin_vel_z": self._cost_lin_vel_z(self.get_global_linvel(data)),
         "ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
-        "orientation": self._cost_orientation(self.get_upvector(data)),
-        #"stand_still": self._cost_stand_still(info["command"], data.qpos[7:]),
+        "pose": self._reward_pose(data.qpos[7:]),
+        "dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
         "termination": self._cost_termination(done),
-        #"pose": self._reward_pose(data.qpos[7:]),
-        "torques": self._cost_torques(data.actuator_force),
+        "residual_torque": self._cost_residual_torque(llc["tau_rl"]),
+        "residual_saturation": jp.mean(llc["saturated"]),
         "action_rate": self._cost_action_rate(
             action, info["last_act"], info["last_last_act"]
         ),
-        #"energy": self._cost_energy(data.qvel[6:], data.actuator_force),
-        #"feet_slip": self._cost_feet_slip(data, contact, info),
-        #"feet_clearance": self._cost_feet_clearance(data),
-        #"feet_height": self._cost_feet_height(
-        #    info["swing_peak"], first_contact, info
-        #),
-        #"feet_air_time": self._reward_feet_air_time(
-        #    info["feet_air_time"], first_contact, info["command"]
-        #),
-        #"dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
+        "action_accel": self._cost_action_accel(
+            action, info["last_act"], info["last_last_act"]
+        ),
+        "torques": self._cost_torques(data.actuator_force),
+        "energy": self._cost_energy(data.qvel[6:], data.actuator_force),
     }
+
+  def _cost_residual_torque(self, tau_rl: jax.Array) -> jax.Array:
+    """Keep the residual small: the MPC baseline must stay a good solution."""
+    return jp.mean(jp.square(tau_rl))
+
+  def _cost_action_accel(
+      self, act: jax.Array, last_act: jax.Array, last_last_act: jax.Array
+  ) -> jax.Array:
+    """Second difference of the action, i.e. discrete jerk."""
+    return jp.sum(jp.square(act - 2.0 * last_act + last_last_act))
 
   # Tracking rewards.
 

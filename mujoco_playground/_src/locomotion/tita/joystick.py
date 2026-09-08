@@ -109,6 +109,7 @@ def default_config() -> config_dict.ConfigDict:
           a=[1.0, 0.5],     # amplitude (uniform half-range) per command
           b=[0.75, 0.75],    # prob a resampled command stays non-zero
           h=[0.4, 0.4],    # CoM height command range [min, max] [m]
+          names=["vx", "wz"]
       ),
       impl="jax",
       naconmax=4 * 8192,

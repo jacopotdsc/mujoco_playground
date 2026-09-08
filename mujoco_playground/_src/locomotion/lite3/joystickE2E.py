@@ -120,6 +120,7 @@ def default_config() -> config_dict.ConfigDict:
           #a=[0.0, 0.0, 0.0],  # Set to 0.0 to disable command.
           # Probability of not zeroing out new command.
           b=[0.9, 0.25, 0.5],
+          names=["vx", "vy", "wz"],
       ),
       impl="jax",
       naconmax=4 * 8192,
