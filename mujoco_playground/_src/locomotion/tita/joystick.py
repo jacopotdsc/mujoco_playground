@@ -151,6 +151,7 @@ def default_config() -> config_dict.ConfigDict:
                                   # while the residual still practices the hard region.
           b=[0.75, 0.75],    # prob a resampled command stays non-zero
           h=[0.4, 0.4],    # CoM height command range [min, max] [m]
+          names=["vx", "wz"]
       ),
       impl="jax",
       naconmax=4 * 8192,
