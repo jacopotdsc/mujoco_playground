@@ -27,13 +27,26 @@
                  width="300"
                  height="300"/>
         <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.0"/>
-        <hfield name="perlin_hfield" size="5.0 5.0 0.5 0.01" file="height_field.png"/>
+        <!-- Tapered-island version of height_field.png, see
+             diagnostics/make_perlin_hfield.py. size z / geom pos below are
+             derived from the generated grid -- rerun that script if you retune
+             it, and copy the attributes it prints. -->
+        <hfield name="perlin_hfield" size="5.0 5.0 0.4127 0.01" file="height_field_island.png"/>
     </asset>
 
     <worldbody>
         <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
-        <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
-        <geom type="hfield" hfield="perlin_hfield" pos="0.0 0.0 0.0" quat="1.0 0.0 0.0 0.0" material="groundplane"/>
+        <!-- The plain the island sits on: 3 mm under the terrain's lowest point,
+             which is also the level its tapered border meets. Walking off the
+             hfield is a step down of 3 mm instead of the 0.41-0.54 m drop off
+             the untapered field's vertical wall. -->
+        <geom name="floor" size="0 0 0.05" type="plane" pos="0.0 0.0 -0.2388" material="groundplane" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+        <!-- Sunk so the flattened centre pad sits at foot-sole level for the
+             "home" keyframe (torso z=0.31, feet 0.286 lower => soles at
+             z=0.0023). The hfield data is normalized to [0,1] at compile time,
+             so without this offset the terrain spans 0..0.5 m above the world
+             origin and the robot spawns buried a quarter metre inside it. -->
+        <geom type="hfield" hfield="perlin_hfield" pos="0.0 0.0 -0.2358" quat="1.0 0.0 0.0 0.0" material="groundplane" contype="1" conaffinity="0" condim="3" priority="1" friction="0.6" />
     </worldbody>
 
     <include file="sensor_feet.xml"/>

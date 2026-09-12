@@ -46,6 +46,12 @@ def default_config() -> config_dict.ConfigDict:
       # a +-30 N.m limit, so 6.0 N.m is ~1.7x the baseline rms and still leaves
       # 18.1 + 6.0 = 24.1 N.m, i.e. no saturation even in the worst scenario.
       residual_torque_scale=6.0,
+      # Gate on the residual branch of the low-level controller. False runs the
+      # MPC + whole-body controller alone, by multiplying tau_rl by 0.0 instead
+      # of adding it to tau_mpc (see step()). Note that feeding a ZERO ACTION is
+      # not the same thing: tau_rl is a PD around _default_pose, so at action=0
+      # it still pulls the joints toward the nominal stance.
+      enable_residual=True,
       action_repeat=1,
       action_scale=0.5,
       history_len=1,
@@ -178,30 +184,24 @@ class Joystick(lite3_base.Lite3Env):
     self.mpc_period = max(1, int(sim_frequency / config.mpc_frequency))
     self.mpc = BatchedMPCControllerWrapper(config, 1)
 
-    for i in range(self._mj_model.ngeom):
-        name = mujoco.mj_id2name(self._mj_model, mujoco.mjtObj.mjOBJ_GEOM, i)
-        # Salta le geom del robot (piedi, trunk, visual, ecc.)
-        if name in (consts.FEET_GEOMS) or name is None:
-            pass  # i piedi hanno già conaffinity=1
-        
-        # Floor e box terreno: devono avere contype=1
-        if name == "floor" or name is None:
-            # Le geom senza nome sono i box del terreno
-            geom_type = self._mj_model.geom_type[i]
-            if geom_type == mujoco.mjtGeom.mjGEOM_PLANE or geom_type == mujoco.mjtGeom.mjGEOM_BOX:
-                self._mj_model.geom_contype[i] = 1
-                self._mj_model.geom_conaffinity[i] = 0
-                self._mj_model.geom_condim[i] = 3
+    # NOTE: do NOT flip geom_contype/conaffinity/condim here. MuJoCo builds the
+    # world body's collision BVH at COMPILE time from those flags, and mutating
+    # them on an already-compiled model leaves the tree empty (1 node): MuJoCo
+    # then never collides with the terrain, while mjx.put_model re-enumerates
+    # the pairs from the mutated flags and does. The two disagree, and the
+    # contacts MJX builds on that inconsistent model blow the solver up
+    # (efc forces ~1e11, NaN within a few substeps). The terrain geoms declare
+    # contype/conaffinity/condim/priority/friction in the scene XML instead,
+    # the way the Tita scenes already do.
 
-    # Rebuild mjx_model so contact array shapes match the modified mj_model.
-    # base.__init__ called mjx.put_model before this _post_init ran, so the
-    # compiled mjx_model had stale condim/contype/conaffinity values which
-    # caused shape mismatches in mjx contact solvers.
     # Actuator torque limits, read from the model rather than hardcoded.
     self._tau_min = jp.array(self._mj_model.actuator_ctrlrange[:, 0])
     self._tau_max = jp.array(self._mj_model.actuator_ctrlrange[:, 1])
 
-    self._mjx_model = mjx.put_model(self._mj_model, impl=self._config.impl)
+    # Multiplier for the residual branch in step(). A plain Python float, not a
+    # traced value: the flag is static configuration, so XLA folds the multiply
+    # away and the disabled case costs nothing.
+    self._residual_gain = 1.0 if self._config.enable_residual else 0.0
 
   def reset(self, rng: jax.Array) -> mjx_env.State:
     qpos = self._init_q
@@ -419,8 +419,13 @@ class Joystick(lite3_base.Lite3Env):
         
         tau_p = self._config.Kp * ( self._default_pose + action*self._config.action_scale - data.qpos[7:])
         tau_d = self._config.Kd * ( - data.qvel[6:])
-        tau_rl = tau_p + tau_d
-        
+        # config.enable_residual: 1.0 keeps the residual branch, 0.0 removes it
+        # and leaves the MPC + whole-body controller torque on its own. The gain
+        # is applied to tau_rl itself, so what gets logged (and what the
+        # residual_torque / residual_saturation costs read) is the torque that
+        # was actually applied.
+        tau_rl = self._residual_gain * (tau_p + tau_d)
+
         tau_final = tau_mpc + tau_rl
         tau_final = jp.clip(tau_final, self._tau_min, self._tau_max)
 

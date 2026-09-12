@@ -1,0 +1,54 @@
+<mujoco model="lite3 scene">
+    <include file="lite3.xml"/>
+
+
+    <statistic center="0 0 0.1" extent="0.8"/>
+
+    <visual>
+        <headlight diffuse="0.3 0.3 0.3" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+        <rgba haze="0.15 0.25 0.35 1"/>
+        <global azimuth="-130" elevation="-20"/>
+    </visual>
+
+    <asset>
+        <texture type="skybox"
+                 builtin="gradient"
+                 rgb1="0.99 0.99 0.99"
+                 rgb2="0.99 0.99 0.99"
+                 width="512"
+                 height="3072"/>
+        <texture type="2d"
+                 name="groundplane"
+                 builtin="checker"
+                 mark="edge"
+                 rgb1="0.80 0.80 0.80"
+                 rgb2="0.99 0.99 0.99"
+                 markrgb="0.3 0.3 0.3"
+                 width="300"
+                 height="300"/>
+        <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.0"/>
+        <hfield name="perlin_hfield" size="5.0 5.0 0.5 0.01" file="height_field.png"/>
+    </asset>
+
+    <worldbody>
+        <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+        <!-- Safety net, kept ~3.5 cm below the lowest point of the sunk hfield
+             (-0.2647) so it never doubles up contacts with the terrain. -->
+        <geom name="floor" size="0 0 0.05" type="plane" pos="0.0 0.0 -0.30" material="groundplane" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+        <!-- Terrain placement for the "home" spawn (torso z=0.31, feet 0.286
+             lower, so foot soles at z=0.0023).
+             z: the hfield data is normalized to [0,1] at compile time, so the
+             raw terrain spans 0..0.5 m and used to rise ~0.27 m under the feet:
+             the robot spawned buried inside the hill. Sinking the geom by
+             0.2647 brings the surface under the spawn up to sole level, as in
+             scene_flat / scene_rough.
+             xy: the terrain is also slid by (-0.55, 1.5) so the spawn lands on
+             a locally flat patch. Untranslated, the four feet sat on a 13 deg
+             slope with 8.2 cm of height spread and the robot dropped onto three
+             legs at every reset; here the spread is 2.2 mm (1.9 cm worst case
+             if the yaw randomization in reset() is re-enabled). -->
+        <geom type="hfield" hfield="perlin_hfield" pos="-0.55 1.5 -0.2647" quat="1.0 0.0 0.0 0.0" material="groundplane"/>
+    </worldbody>
+
+    <include file="sensor_feet.xml"/>
+</mujoco>
