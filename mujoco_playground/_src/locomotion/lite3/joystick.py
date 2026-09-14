@@ -291,6 +291,9 @@ class Joystick(lite3_base.Lite3Env):
         "pert_dir": jp.zeros(3),
         "pert_mag": pert_mag,
         "mpc_state": mpc_state,
+        # SRBD control (GRF) exposed to the policy, like Tita's mpc_control.
+        "mpc_control": mpc_state.grf[0],
+        "mpc_control_last": mpc_state.grf[0],   # previous step (equal on reset)
         #"mpc_obs": mpc_obs,
         "mpc_tau": tau,
         "low_level_controller": {
@@ -413,6 +416,9 @@ class Joystick(lite3_base.Lite3Env):
         state.info["command"], state.info["mpc_state"],
     )
     state.info["mpc_state"] = mpc_state
+    # Feed the SRBD control (GRF) to the observation, like Tita's mpc_control.
+    state.info["mpc_control_last"] = state.info["mpc_control"]
+    state.info["mpc_control"] = mpc_state.grf[0]
 
     def substep_fn(data, _):
         tau_mpc, _ = self._whole_body_ctrl(data.qpos, data.qvel, mpc_state)
@@ -563,7 +569,13 @@ class Joystick(lite3_base.Lite3Env):
         * self._config.noise_config.scales.linvel
     )
 
-    #mpc_obs = info["mpc_obs"]  # 28: grf(12) + foot_ref(12) + contact(4)
+    # SRBD control exposed to the policy (Lite3 analogue of Tita's mpc_control):
+    # the MPC ground-reaction forces, 3 per foot x 4 feet = 12 (FL, FR, HL, HR).
+    # Normalize by the nominal per-foot static load (m*g/4) so they enter the
+    # observation at ~O(1) instead of ~30 N, keeping the observation well scaled.
+    mpc_control = info["mpc_control"]                 # 12 = grf(FL,FR,HL,HR)
+    foot_static_load = config.mass * 9.81 / 4.0       # ~29 N per foot
+    mpc_control_grf = mpc_control / foot_static_load   # 12, ~O(1)
 
     state = jp.hstack([
         noisy_linvel,  # 3
@@ -573,6 +585,7 @@ class Joystick(lite3_base.Lite3Env):
         noisy_joint_vel,  # 12
         last_act,  # 12
         info["command"],  # 3
+        mpc_control_grf,  # 12  MPC: SRBD ground-reaction forces (control)
     ])
 
     accelerometer = self.get_accelerometer(data)

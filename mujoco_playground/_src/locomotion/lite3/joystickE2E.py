@@ -63,7 +63,7 @@ def default_config() -> config_dict.ConfigDict:
       history_len=1,
       soft_joint_pos_limit_factor=0.95,
       noise_config=config_dict.create(
-          level=1.0,  # Set to 0.0 to disable noise.
+          level=0.0,  # Set to 0.0 to disable noise.
           scales=config_dict.create(
               joint_pos=0.03,
               joint_vel=1.5,
@@ -282,18 +282,18 @@ class Joystick(lite3_base.Lite3Env):
     # x=+U(-0.5, 0.5), y=+U(-0.5, 0.5), yaw=U(-3.14, 3.14).
     rng, key = jax.random.split(rng)
     dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
-    qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
+    #qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
     rng, key = jax.random.split(rng)
     yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
     quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
     new_quat = math.quat_mul(qpos[3:7], quat)
-    qpos = qpos.at[3:7].set(new_quat)
+    #qpos = qpos.at[3:7].set(new_quat)
 
     # d(xyzrpy)=U(-0.5, 0.5)
     rng, key = jax.random.split(rng)
-    qvel = qvel.at[0:6].set(
-        jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5)
-    )
+    #qvel = qvel.at[0:6].set(
+    #    jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5)
+    #)
 
     data = mjx_env.make_data(
         self.mj_model,
