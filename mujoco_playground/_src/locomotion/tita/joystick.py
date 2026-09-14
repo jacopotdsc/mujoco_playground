@@ -80,8 +80,8 @@ def default_config() -> config_dict.ConfigDict:
       residual_config=config_dict.create(
           enabled=True,          # False -> pure MPC/WBC (residual torque = 0)
           scale=0.5,             # blend factor lambda on the residual torque
-          Kp=20.0,               # residual leg PD proportional gain
-          Kd=0.5,                # residual leg PD derivative gain
+          Kp=35.0,               # residual leg PD proportional gain
+          Kd=10.0,                # residual leg PD derivative gain
           Kd_wheel=0.5,          # residual wheel velocity gain
           tau_limit_leg=25.0,    # residual torque clip on legs [N m]
           tau_limit_wheel=12.5,  # residual torque clip on wheels [N m]
@@ -143,8 +143,8 @@ def default_config() -> config_dict.ConfigDict:
           # command range is set toward that ramp limit: the residual learns
           # where the nominal actually struggles (~2.5-3.5).
           command_lpf=0.02,       # 0.02 = ramp (train/eval/deploy); 1.0 = instant step
-          a=[2.0, 0.8],           # full command half-range: vx +-2.0, wz +-0.8 (B's proven range)
-          a_learned=[1.5, 0.6],   # survivable inner range
+          a=[2.5, 0.8],           # full command half-range: vx +-2.0, wz +-0.8 (B's proven range)
+          a_learned=[2.0, 0.6],   # survivable inner range
           p_extend=0.3,           # ~70% of commands in [-a_learned, a_learned], ~30% in
                                   # the extension band [a_learned, a] (either sign), so
                                   # most episodes are survivable (strong, stable signal)
