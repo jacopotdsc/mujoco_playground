@@ -80,17 +80,19 @@ def default_config() -> config_dict.ConfigDict:
       residual_config=config_dict.create(
           enabled=True,          # False -> pure MPC/WBC (residual torque = 0)
           scale=0.5,             # blend factor lambda on the residual torque
-          Kp=35.0,               # residual leg PD proportional gain
-          Kd=10.0,                # residual leg PD derivative gain
+          Kp=20.0,               # residual leg PD proportional gain
+          Kd=0.5,                # residual leg PD derivative gain
           Kd_wheel=0.5,          # residual wheel velocity gain
           tau_limit_leg=25.0,    # residual torque clip on legs [N m]
           tau_limit_wheel=12.5,  # residual torque clip on wheels [N m]
       ),
       noise_config=config_dict.create(
-          level=0.0,
+          level=1.0,
           scales=config_dict.create(
-              joint_pos=0.01,
-              joint_vel=1.5,
+              joint_pos=0.03,
+              joint_vel=0.1,
+              joint_mpc_pos=0.01,
+              joint_mpc_vel=0.1,
               gyro=0.2,
               gravity=0.05,
               linvel=0.1,
@@ -105,8 +107,8 @@ def default_config() -> config_dict.ConfigDict:
               # Command tracking (command-normalized exp kernel). Weights kept at
               # the training-stable scale (run 2); the normalization — not a
               # weight increase — is what supplies the extension gradient.
-              tracking_lin_vel=1.0,
-              tracking_ang_vel=0.5,
+              tracking_lin_vel=10.0,
+              tracking_ang_vel=5.0,
               # Stability / recovery: keep the base upright and at height.
               orientation=-1.0,
               base_height=-1.0,
@@ -115,8 +117,9 @@ def default_config() -> config_dict.ConfigDict:
               # default pose, the non-interfering action is NOT zero, so a strong
               # ||action|| penalty would push toward the zero-action overshoot and
               # HURT preservation. The tracking reward sets the action magnitude.
-              residual=-0.1,
-              action_rate=-0.01,
+              residual=-0.0,
+              action_rate=-0.001,
+              action_rate_2nd=-0.0001,
               # Safety: leg joint soft-limit hinge.
               dof_pos_limits=-1.0,
               # Failure.
@@ -304,6 +307,44 @@ class Joystick(tita_base.TitaEnv):
     ])
     return x0, theta
 
+  def _get_noisy_joint_state(
+        self,
+        qpos: jax.Array,
+        qvel: jax.Array,
+        rng: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Returns qpos/qvel with noise applied only to actuated joints."""
+    rng, qpos_rng, qvel_rng = jax.random.split(rng, 3)
+
+    joint_qpos_measured = (
+        qpos[7:]
+        + jax.random.uniform(
+            qpos_rng,
+            shape=qpos[7:].shape,
+            minval=-1.0,
+            maxval=1.0,
+        )
+        * self._config.noise_config.level
+        * self._config.noise_config.scales.joint_mpc_pos
+    )
+
+    joint_qvel_measured = (
+        qvel[6:]
+        + jax.random.uniform(
+            qvel_rng,
+            shape=qvel[6:].shape,
+            minval=-1.0,
+            maxval=1.0,
+        )
+        * self._config.noise_config.level
+        * self._config.noise_config.scales.joint_mpc_vel
+    )
+
+    qpos_measured = qpos.at[7:].set(joint_qpos_measured)
+    qvel_measured = qvel.at[6:].set(joint_qvel_measured)
+
+    return rng, qpos_measured, qvel_measured
+
   def _joint_targets_from_qddot(self, qpos_joint, qvel_joint, qddot):
     """NOMINAL joint targets: current joint state integrated one simulation step
     with the WBC's solved joint accelerations. Used ONLY for the nominal MPC/WBC
@@ -360,11 +401,11 @@ class Joystick(tita_base.TitaEnv):
     # x,y = +U(-0.5, 0.5), yaw = U(-pi, pi).
     rng, key = jax.random.split(rng)
     dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
-    #qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
+    qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
     rng, key = jax.random.split(rng)
     yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
     quat = math.axis_angle_to_quat(jp.array([0.0, 0.0, 1.0]), yaw)
-    #qpos = qpos.at[3:7].set(math.quat_mul(qpos[3:7], quat))
+    qpos = qpos.at[3:7].set(math.quat_mul(qpos[3:7], quat))
 
     # Start under mild planar motion. Ranges kept small for the STATIONARY task:
     # with the wheels reset to v_des=0, even vx=0.2 m/s pitches the base ~64 deg
@@ -378,7 +419,7 @@ class Joystick(tita_base.TitaEnv):
     #qvel = qvel.at[0:2].set(jp.concatenate([vx, vy]))
     rng, key = jax.random.split(rng)
     joint_vel = jax.random.uniform(key, shape=qvel[6:].shape, minval=-0.2, maxval=0.2,)
-    #qvel = qvel.at[6:].set(joint_vel)
+    qvel = qvel.at[6:].set(joint_vel)
 
     ctrl = jp.zeros(self.mjx_model.nu)
 
@@ -433,11 +474,19 @@ class Joystick(tita_base.TitaEnv):
     # passive pass so all MPC info fields are populated with correct shapes.
     # The command fed to the MPC starts at zero (matches info["command"]).
     # ------------------------------------------------------------------
+
+    _, qpos_measured, qvel_measured = (
+        self._get_noisy_joint_state(
+            data.qpos,
+            data.qvel,
+            rng,
+        )
+    )
     mpc_state = self.mpc.init_state()
     mpc_state, tita_state, dfcip_state, mpc_tau, mpc_qddot, mpc_fl, mpc_fr, desired, theta_prev, mpc_reference, _solver_bad = self._run_mpc_wbc(
         data=data,
-        qpos=data.qpos,
-        qvel=data.qvel,
+        qpos=qpos_measured,
+        qvel=qvel_measured,
         command=cmd,
         base_height_target=base_height_target,
         action=jp.zeros(self.mjx_model.nu),
@@ -476,6 +525,8 @@ class Joystick(tita_base.TitaEnv):
         "robot": {
             "qpos": data.qpos,
             "qvel": data.qvel,
+            "qpos_measured": qpos_measured,
+            "qvel_measured": qvel_measured,
             "com_height": data.sensordata[self._base_com_adr][2],
             "local_linvel": self.get_local_linvel(data),
             "gyro": self.get_gyro(data),
@@ -606,10 +657,19 @@ class Joystick(tita_base.TitaEnv):
 
     action = jp.clip(action, -1.0, 1.0)
 
+    rng = state.info["rng"]
+    _, qpos_measured, qvel_measured = (
+        self._get_noisy_joint_state(
+            state.data.qpos,
+            state.data.qvel,
+            rng,
+        )
+    )
+
     new_mpc_state, tita_state, dfcip_state, new_tau, new_qddot, mpc_fl, mpc_fr, desired, theta_prev, mpc_reference, solver_bad = self._run_mpc_wbc(
         data=state.data,
-        qpos=state.data.qpos,
-        qvel=state.data.qvel,
+        qpos=qpos_measured,
+        qvel=qvel_measured,
         command=state.info["command"],
         base_height_target=state.info["base_height_target"],
         action=action,
@@ -655,19 +715,32 @@ class Joystick(tita_base.TitaEnv):
     residual_gate = rc.scale * (1.0 if rc.enabled else 0.0)
 
     def substep_fn(data, _):
-        q  = data.qpos[7:]
-        qd = data.qvel[6:]
+        data, rng = data
+        #q  = data.qpos[7:]
+        #qd = data.qvel[6:]
+
+        rng, q_measured, qd_measured = (
+            self._get_noisy_joint_state(
+                data.qpos,
+                data.qvel,
+                rng,
+            )
+        )
+
+        q = q_measured[7:]
+        qd = qd_measured[6:]
         # Refresh the nominal outer-PD target every substep (500 Hz) from the
         # current joint state and the held WBC qddot, matching the standalone.
         q_des_wbc, dq_des_wbc = self._joint_targets_from_qddot(q, qd, qddot)
         tau_nom, tau_rl, ctrl = self._combine_torque(q, qd, tau, q_des_wbc, dq_des_wbc, q_des_rl, dq_des_rl, residual_gate)
         data = data.replace(ctrl=ctrl)
         data = mjx.step(self.mjx_model, data)
-        return data, (tau_nom, tau_rl, ctrl)
+        return (data, rng), (tau_nom, tau_rl, ctrl)
 
-    data, (tau_nom_s, tau_rl_s, tau_tot_s) = jax.lax.scan(
-        substep_fn, state.data, xs=None, length=self.n_substeps)
+    (data, rng), (tau_nom_s, tau_rl_s, tau_tot_s) = jax.lax.scan(
+        substep_fn, (state.data, rng), xs=None, length=self.n_substeps)
     state = state.replace(data=data)
+    state.info["rng"] = rng
 
     # Torque diagnostics from the last substep (logged only; no separate subgraph).
     tau_nom_d, tau_rl_d, tau_tot_d = tau_nom_s[-1], tau_rl_s[-1], tau_tot_s[-1]
@@ -706,6 +779,8 @@ class Joystick(tita_base.TitaEnv):
     state.info["robot"] = {
         "qpos": data.qpos,
         "qvel": data.qvel,
+        "qpos_measured": qpos_measured,
+        "qvel_measured": qvel_measured,
         "com_height": data.sensordata[self._base_com_adr][2],
         "local_linvel": self.get_local_linvel(data),
         "gyro": self.get_gyro(data),
@@ -983,6 +1058,7 @@ class Joystick(tita_base.TitaEnv):
         # Residual regularity + smoothness.
         "residual": self._cost_residual(action),
         "action_rate": self._cost_action_rate(action, info["last_act"]),
+        "action_rate_2nd": self._cost_action_rate_2nd(action, info["last_act"], info["last_last_act"]),
         # Safety + failure.
         "dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
         "termination": self._cost_termination(done),
@@ -1070,6 +1146,13 @@ class Joystick(tita_base.TitaEnv):
     # Dimensionless action difference (no 1/dt): the global x dt then leaves a
     # clean per-step magnitude instead of inverting to 1/dt.
     return jp.sum(jp.square(act - last_act))
+
+  def _cost_action_rate_2nd(
+      self, act: jax.Array, last_act: jax.Array, last_last_act: jax.Array
+  ) -> jax.Array:
+    """Second difference of the action, i.e. discrete jerk."""
+    return jp.sum(jp.square(act - 2.0 * last_act + last_last_act))
+
 
   def _cost_joint_pos_limits(self, qpos: jax.Array) -> jax.Array:
     q = qpos[self._leg_ids]
