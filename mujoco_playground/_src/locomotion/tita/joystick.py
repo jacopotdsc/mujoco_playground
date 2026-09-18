@@ -59,7 +59,7 @@ def default_config() -> config_dict.ConfigDict:
       ctrl_dt=0.01,
       sim_dt=0.002,
       episode_length=1000,
-      randomize_reset=0.0,
+      randomize_reset=1.0,
       # Nominal MPC/WBC outer PD: converts the WBC's solved joint accelerations
       # into torque on top of the WBC feedforward. The target is recomputed every
       # physics substep (500 Hz) from the current joint state and the held qddot,
@@ -483,7 +483,14 @@ class Joystick(tita_base.TitaEnv):
             rng,
         )
     )
-    mpc_state = self.mpc.init_state()
+    tita_state0 = self.build_tita_state(data)
+    dfcip_state0, theta0 = self.get_dfip_current_state(
+        tita_state0,
+        jp.array(0.0),
+    )
+
+    # Initialize the complete MPC warm-start from the actual reset state.
+    mpc_state = self.mpc.init_state(dfcip_state0[None, :])
     mpc_state, tita_state, dfcip_state, mpc_tau, mpc_qddot, mpc_fl, mpc_fr, desired, theta_prev, mpc_reference, _solver_bad = self._run_mpc_wbc(
         data=data,
         qpos=data.qpos,
@@ -658,14 +665,16 @@ class Joystick(tita_base.TitaEnv):
 
     action = jp.clip(action, -1.0, 1.0)
 
+    # Feed the MPC/WBC the SAME noisy joint measurement the policy observed
+    # (state.info["q_measured"]/["qd_measured"] are the actuated-joint angles/
+    # velocities, length nj). Rebuild the FULL qpos/qvel (base + joints) the
+    # WBC forward-kinematics needs, keeping the true base pose and overwriting
+    # only the joint block with the shared noisy measurement.
+    qpos_measured = state.data.qpos.at[7:].set(state.info["q_measured"])
+    qvel_measured = state.data.qvel.at[6:].set(state.info["qd_measured"])
+
+    # PRNG stream for the 500 Hz substep loop (consumed by the outer-PD noise).
     rng = state.info["rng"]
-    _, qpos_measured, qvel_measured = (
-        self._get_noisy_joint_state(
-            state.data.qpos,
-            state.data.qvel,
-            rng,
-        )
-    )
 
     new_mpc_state, tita_state, dfcip_state, new_tau, new_qddot, mpc_fl, mpc_fr, desired, theta_prev, mpc_reference, solver_bad = self._run_mpc_wbc(
         data=state.data,
@@ -928,6 +937,7 @@ class Joystick(tita_base.TitaEnv):
         * self._config.noise_config.level
         * self._config.noise_config.scales.joint_pos
     )
+    info["q_measured"] = noisy_joint_angles
 
     joint_vel = data.qvel[6:]
     info["rng"], noise_rng = jax.random.split(info["rng"])
@@ -937,6 +947,7 @@ class Joystick(tita_base.TitaEnv):
         * self._config.noise_config.level
         * self._config.noise_config.scales.joint_vel
     )
+    info["qd_measured"] = noisy_joint_vel
 
     linvel = self.get_local_linvel(data)
     info["rng"], noise_rng = jax.random.split(info["rng"])
