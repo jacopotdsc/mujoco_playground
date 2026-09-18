@@ -59,6 +59,7 @@ def default_config() -> config_dict.ConfigDict:
       ctrl_dt=0.01,
       sim_dt=0.002,
       episode_length=1000,
+      randomize_reset=0.0,
       # Nominal MPC/WBC outer PD: converts the WBC's solved joint accelerations
       # into torque on top of the WBC feedforward. The target is recomputed every
       # physics substep (500 Hz) from the current joint state and the held qddot,
@@ -89,7 +90,7 @@ def default_config() -> config_dict.ConfigDict:
       noise_config=config_dict.create(
           level=1.0,
           scales=config_dict.create(
-              joint_pos=0.03,
+              joint_pos=0.01,
               joint_vel=0.1,
               joint_mpc_pos=0.01,
               joint_mpc_vel=0.1,
@@ -148,7 +149,7 @@ def default_config() -> config_dict.ConfigDict:
           command_lpf=0.02,       # 0.02 = ramp (train/eval/deploy); 1.0 = instant step
           a=[2.5, 0.8],           # full command half-range: vx +-2.0, wz +-0.8 (B's proven range)
           a_learned=[2.0, 0.6],   # survivable inner range
-          p_extend=0.3,           # ~70% of commands in [-a_learned, a_learned], ~30% in
+          p_extend=0.2,           # ~70% of commands in [-a_learned, a_learned], ~30% in
                                   # the extension band [a_learned, a] (either sign), so
                                   # most episodes are survivable (strong, stable signal)
                                   # while the residual still practices the hard region.
@@ -413,12 +414,12 @@ class Joystick(tita_base.TitaEnv):
     # as a hard recovery instead of standing. Lateral (vy) self-damps via wheel
     # friction, so it is kept smaller still.
     rng, key = jax.random.split(rng)
-    vx = jax.random.uniform(key, (1,), minval=-0.2, maxval=0.2)
+    vx = jax.random.uniform(key, (1,), minval=-0.2, maxval=0.2) * self._config.randomize_reset
     rng, key = jax.random.split(rng)
-    vy = jax.random.uniform(key, (1,), minval=-0.1, maxval=0.1)
+    vy = jax.random.uniform(key, (1,), minval=-0.1, maxval=0.1) * self._config.randomize_reset
     #qvel = qvel.at[0:2].set(jp.concatenate([vx, vy]))
     rng, key = jax.random.split(rng)
-    joint_vel = jax.random.uniform(key, shape=qvel[6:].shape, minval=-0.2, maxval=0.2,)
+    joint_vel = jax.random.uniform(key, shape=qvel[6:].shape, minval=-0.2, maxval=0.2,) * self._config.randomize_reset
     qvel = qvel.at[6:].set(joint_vel)
 
     ctrl = jp.zeros(self.mjx_model.nu)
@@ -485,8 +486,8 @@ class Joystick(tita_base.TitaEnv):
     mpc_state = self.mpc.init_state()
     mpc_state, tita_state, dfcip_state, mpc_tau, mpc_qddot, mpc_fl, mpc_fr, desired, theta_prev, mpc_reference, _solver_bad = self._run_mpc_wbc(
         data=data,
-        qpos=qpos_measured,
-        qvel=qvel_measured,
+        qpos=data.qpos,
+        qvel=data.qvel,
         command=cmd,
         base_height_target=base_height_target,
         action=jp.zeros(self.mjx_model.nu),
