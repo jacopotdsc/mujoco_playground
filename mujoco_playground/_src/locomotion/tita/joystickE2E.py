@@ -40,22 +40,29 @@ def default_config() -> config_dict.ConfigDict:
       ctrl_dt=0.01,
       sim_dt=0.002,
       episode_length=1000,
+      randomize_reset=1.0,
       Kp=50.0,
       Kd=1.0,
       Kd_wheel=0.5,      # kv delle ruote (velocity control)
       action_repeat=1,
-      action_scale_pos=0.5,
-      # 5.0 -> executed wheel law tau = 0.5*(5*a - w) = 2.5*a - 0.5*w, IDENTICAL to the
-      # DDT Isaac Gym reference (2.5*a - 0.5*w). Was 30.0, which gave 15*a - 0.5*w:
-      # 6x the reference feedforward, i.e. a unit action produced ~3-4x the corrective
-      # torque a moderate lean needs (~4 N*m/wheel at 0.1 rad) -> over-twitchy wheels.
-      action_scale_vel=25.0,
+      action_scale_pos=0.5,      # leg action -> position-target offset [rad] about home pose
+      # Wheel action -> wheel angular-velocity target [rad/s]: v_des = action * scale.
+      # action in [-1,1] -> +-30 rad/s -> +-2.78 m/s at wheel radius 0.0925 m, which
+      # COVERS the command range (|vx| up to 2.5) with margin. NB: the previous
+      # value 25 capped linear speed at 25*0.0925 = 2.31 m/s < the 2.5 command, so
+      # high-vx commands saturated (action->1) and could NOT be tracked; raising it
+      # to 30 lets the wheels actually reach 2.5 m/s and lifted the flat-terrain
+      # full-range result from ~12.6 to ~13.75 with 100% episode survival (run
+      # 20260919_200655). The applied wheel torque is tau_wheel = Kd_wheel*(v_des-w);
+      # the actuator limit is 120 N*m (>> the ~15 N*m a full-scale action produces),
+      # so the wheels never saturate on torque.
+      action_scale_vel=30.0,
       soft_joint_pos_limit_factor=0.95, 
       noise_config=config_dict.create(
-          level=0.0,
+          level=1.0,
           scales=config_dict.create(
               joint_pos=0.01,
-              joint_vel=1.5,
+              joint_vel=0.1,
               gyro=0.2,
               gravity=0.05,
               linvel=0.1,
@@ -65,14 +72,12 @@ def default_config() -> config_dict.ConfigDict:
           scales=config_dict.create(
               tracking_lin_vel=1.0,
               tracking_ang_vel=0.5,
-              orientation=-1.0,
-              ang_vel_xy=-0.3,
+              orientation=-1.0,   # base tilt (upright); covers roll/pitch stability
               base_height=-1.0,
               posture=-1.0,      # command-gated; see _cost_posture
               torques=-1e-4,
               action_rate=-0.01,
               dof_pos_limits=-1.0,
-              dof_vel=-0.0,
               termination=-100.0,
           ),
           only_positive_rewards=False,
@@ -86,12 +91,19 @@ def default_config() -> config_dict.ConfigDict:
           kick_durations=[0.05, 0.2],
           kick_wait_times=[1.0, 3.0],
       ),
-      # Command = [forward_vel (m/s), yaw_rate (rad/s)].
+      # Command = [forward_vel (m/s), yaw_rate (rad/s)]. End-to-end: the network
+      # tracks these directly (no MPC/WBC, no residual).
       command_config=config_dict.create(
-          a=[1.0, 0.5],     # amplitude (uniform half-range) per command
+          # The applied command low-pass-tracks the resampled target with gain
+          # command_lpf, so command changes are ramped, not stepped.
+          command_lpf=0.02,       # per-step LPF gain toward target_command
+          a=[2.5, 0.8],           # full command half-range: |vx|<=2.5, |wz|<=0.8
+          a_learned=[2.0, 0.6],   # inner (majority) range
+          p_extend=0.2,           # ~80% of resampled commands in [-a_learned, a_learned],
+                                  # ~20% in the extension band [a_learned, a] (either sign).
           b=[0.75, 0.75],    # prob a resampled command stays non-zero
           h=[0.4, 0.4],    # CoM height command range [min, max] [m]
-          p_stand=0.2,      # prob of an explicit zero (standing) command
+          names=["vx", "wz"]
       ),
       impl="jax",
       naconmax=4 * 8192,
@@ -162,8 +174,11 @@ class Joystick(tita_base.TitaEnv):
     self._base_com_adr = self._sensor_adr("base_subtree_com")
 
     self._cmd_a = jp.array(self._config.command_config.a)
+    self._cmd_a_learned = jp.array(self._config.command_config.a_learned)
+    self._cmd_p_extend = float(self._config.command_config.p_extend)
     self._cmd_b = jp.array(self._config.command_config.b)
     self._cmd_h = jp.array(self._config.command_config.h)
+    self._cmd_resample_scale = 0.5 * self._config.episode_length * self.dt
 
     # Posture weights over the 6 leg joints [hip, thigh, knee] x 2.
     # The hip (leg_1) is the "spread" DOF (d(track)/d(hip) ~ 0.35 m/rad), so it
@@ -234,7 +249,7 @@ class Joystick(tita_base.TitaEnv):
     )
 
     rng, key1, key2 = jax.random.split(rng, 3)
-    time_until_next_cmd = jax.random.exponential(key1) * 5.0
+    time_until_next_cmd = jax.random.exponential(key1) * self._cmd_resample_scale
     steps_until_next_cmd = jp.round(time_until_next_cmd / self.dt).astype(
         jp.int32
     )
@@ -421,13 +436,14 @@ class Joystick(tita_base.TitaEnv):
         self.sample_command(key1, state.info["target_command"]),
         state.info["target_command"],
     )
+    lpf = self._config.command_config.command_lpf
     state.info["command"] = (
         state.info["command"]
-        + 0.02 * (state.info["target_command"] - state.info["command"])
+        + lpf * (state.info["target_command"] - state.info["command"])
     )
     state.info["steps_until_next_cmd"] = jp.where(
         (state.info["steps_until_next_cmd"] <= 0),
-        jp.round(jax.random.exponential(key2) * 5.0 / self.dt).astype(jp.int32),
+        jp.round(jax.random.exponential(key2) * self._cmd_resample_scale / self.dt).astype(jp.int32),
         state.info["steps_until_next_cmd"],
     )
 
@@ -562,14 +578,12 @@ class Joystick(tita_base.TitaEnv):
             command, self.get_gyro(data)),
         # Balance / body configuration.
         "orientation": self._cost_orientation(data),
-        "ang_vel_xy": self._cost_ang_vel_xy(self.get_global_angvel(data)),
         "base_height": self._cost_height(body_height, info["base_height_target"]),
         "posture": self._cost_posture(data.qpos[7:], command),
         # Effort / smoothness / safety.
         "torques": self._cost_torques(data.actuator_force),
         "action_rate": self._cost_action_rate(action, info["last_act"]),
         "dof_pos_limits": self._cost_joint_pos_limits(data.qpos[7:]),
-        "dof_vel": self._cost_dof_vel(data.qvel[6:], command),
         "termination": self._cost_termination(done),
     }
 
@@ -588,9 +602,6 @@ class Joystick(tita_base.TitaEnv):
   def _cost_orientation(self, data: mjx.Data) -> jax.Array:
     # 0 when the base is level; grows with tilt.
     return jp.sum(jp.square(self.get_gravity(data)[:2]))
-
-  def _cost_ang_vel_xy(self, global_angvel: jax.Array) -> jax.Array:
-    return jp.sum(jp.square(global_angvel[:2]))
 
   def _cost_height(self, body_height, base_height_target: jax.Array) -> jax.Array:
     err = body_height - base_height_target
@@ -623,13 +634,6 @@ class Joystick(tita_base.TitaEnv):
     out += jp.clip(q - self._soft_uppers, 0.0, None)
     return jp.sum(out)
 
-  def _cost_dof_vel(self, qvel: jax.Array, command: jax.Array) -> jax.Array:
-    leg_qvel = qvel[jp.array(consts.LEG_DOF_IDS)]     # 6 leg DOF, excludes wheels
-    raw  = jp.sum(jp.square(leg_qvel))
-    gate = jp.exp(-jp.sum(jp.square(command))
-                  / 0.25 )#self._config.reward_config.dof_vel_cmd_sigma)
-    return raw #* gate
-
   def _cost_termination(self, done: jax.Array) -> jax.Array:
     return done
 
@@ -638,11 +642,17 @@ class Joystick(tita_base.TitaEnv):
   # --------------------------------------------------------------------
 
   def sample_command(self, rng: jax.Array, x_k: jax.Array) -> jax.Array:
-    rng, y_rng, w_rng, z_rng = jax.random.split(rng, 4)
+    rng, in_rng, band_rng, sign_rng, ext_rng, w_rng, z_rng = jax.random.split(rng, 7)
     cmd_shape = self._cmd_a.shape[0]
-    y_k = jax.random.uniform(
-        y_rng, shape=(cmd_shape,), minval=-self._cmd_a, maxval=self._cmd_a
-    )
+    # Stratified magnitude: majority in the survivable inner range, a minority in
+    # the extension band [a_learned, a] with random sign.
+    inner = jax.random.uniform(
+        in_rng, (cmd_shape,), minval=-self._cmd_a_learned, maxval=self._cmd_a_learned)
+    band = jax.random.uniform(
+        band_rng, (cmd_shape,), minval=self._cmd_a_learned, maxval=self._cmd_a)
+    sign = jp.where(jax.random.bernoulli(sign_rng, 0.5, (cmd_shape,)), 1.0, -1.0)
+    is_ext = jax.random.bernoulli(ext_rng, self._cmd_p_extend, (cmd_shape,))
+    y_k = jp.where(is_ext, sign * band, inner)
     z_k = jax.random.bernoulli(z_rng, self._cmd_b, shape=(cmd_shape,))
     w_k = jax.random.bernoulli(w_rng, 0.5, shape=(cmd_shape,))
     x_kp1 = x_k - w_k * (x_k - y_k * z_k)
