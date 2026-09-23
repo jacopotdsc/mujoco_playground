@@ -32,6 +32,20 @@ import mpx.config.config_lite3 as config
 from mpx.utils.mpc_wrapper_srbd import BatchedMPCControllerWrapper
 import mpx.utils.sim as sim_utils
 
+
+def _tree_has_nonfinite(tree) -> jax.Array:
+  """True if any float leaf of the pytree contains NaN/Inf."""
+  leaves = jax.tree_util.tree_leaves(tree)
+  checks = [
+      jp.any(~jp.isfinite(x))
+      for x in leaves
+      if jp.issubdtype(jp.asarray(x).dtype, jp.floating)
+  ]
+  if not checks:
+    return jp.array(False)
+  return jp.stack(checks).any()
+
+
 def default_config() -> config_dict.ConfigDict:
   return config_dict.create(
       # Same rates as the validated standalone lite3_srbd.py:
@@ -39,6 +53,7 @@ def default_config() -> config_dict.ConfigDict:
       ctrl_dt=0.02,
       sim_dt=0.005,
       episode_length=1000,
+      randomize_reset=1.0,
       Kp=35.0,
       Kd=0.5,
       # Residual torque budget, in N.m, for an action of magnitude 1. The
@@ -60,7 +75,9 @@ def default_config() -> config_dict.ConfigDict:
           level=1.0,  # Set to 0.0 to disable noise.
           scales=config_dict.create(
               joint_pos=0.03,
-              joint_vel=1.5,
+              joint_vel=0.1,
+              joint_mpc_pos=0.03,
+              joint_mpc_vel=0.1,
               gyro=0.2,
               gravity=0.05,
               linvel=0.1,
@@ -203,6 +220,44 @@ class Joystick(lite3_base.Lite3Env):
     # away and the disabled case costs nothing.
     self._residual_gain = 1.0 if self._config.enable_residual else 0.0
 
+  def _get_noisy_joint_state(
+        self,
+        qpos: jax.Array,
+        qvel: jax.Array,
+        rng: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Returns qpos/qvel with noise applied only to actuated joints."""
+    rng, qpos_rng, qvel_rng = jax.random.split(rng, 3)
+
+    joint_qpos_measured = (
+        qpos[7:]
+        + jax.random.uniform(
+            qpos_rng,
+            shape=qpos[7:].shape,
+            minval=-1.0,
+            maxval=1.0,
+        )
+        * self._config.noise_config.level
+        * self._config.noise_config.scales.joint_mpc_pos
+    )
+
+    joint_qvel_measured = (
+        qvel[6:]
+        + jax.random.uniform(
+            qvel_rng,
+            shape=qvel[6:].shape,
+            minval=-1.0,
+            maxval=1.0,
+        )
+        * self._config.noise_config.level
+        * self._config.noise_config.scales.joint_mpc_vel
+    )
+
+    qpos_measured = qpos.at[7:].set(joint_qpos_measured)
+    qvel_measured = qvel.at[6:].set(joint_qvel_measured)
+
+    return rng, qpos_measured, qvel_measured
+
   def reset(self, rng: jax.Array) -> mjx_env.State:
     qpos = self._init_q
     qvel = jp.zeros(self.mjx_model.nv)
@@ -266,11 +321,19 @@ class Joystick(lite3_base.Lite3Env):
         key2, shape=(3,), minval=-self._cmd_a, maxval=self._cmd_a
     )
 
+    rng, qpos_measured, qvel_measured = (
+        self._get_noisy_joint_state(
+            data.qpos,
+            data.qvel,
+            rng,
+        )
+    )
+
     mpc_state  = self.mpc.init_state()
     mpc_state = self._run_mpc(
-        data, data.qpos, data.qvel, data.geom_xpos, cmd, mpc_state
+        data, qpos_measured, qvel_measured, data.geom_xpos, cmd, mpc_state
     )
-    tau = self._whole_body_ctrl(data.qpos, data.qvel, mpc_state)
+    tau, _ = self._whole_body_ctrl(qpos_measured, qvel_measured, mpc_state)
     #mpc_obs = self._extract_mpc_obs(mpc_state)
 
     info = {
@@ -296,6 +359,8 @@ class Joystick(lite3_base.Lite3Env):
         "mpc_control_last": mpc_state.grf[0],   # previous step (equal on reset)
         #"mpc_obs": mpc_obs,
         "mpc_tau": tau,
+        "qpos_measured": qpos_measured,
+        "qvel_measured": qvel_measured,
         "low_level_controller": {
             "tau_mpc": jp.zeros(self.mjx_model.nu),
             "tau_rl": jp.zeros(self.mjx_model.nu),
@@ -411,20 +476,33 @@ class Joystick(lite3_base.Lite3Env):
       state = self._maybe_apply_perturbation(state)
     # state = self._reset_if_outside_bounds(state)
 
-    mpc_state = self._run_mpc(
-        state.data, state.data.qpos, state.data.qvel, state.data.geom_xpos,
+
+    qpos_measured = state.data.qpos.at[7:].set(state.info["qpos_measured"])
+    qvel_measured = state.data.qvel.at[6:].set(state.info["qvel_measured"])
+
+    new_mpc_state = self._run_mpc(
+        state.data, qpos_measured, qvel_measured, state.data.geom_xpos,
         state.info["command"], state.info["mpc_state"],
+    )
+
+    bad_mpc = _tree_has_nonfinite(new_mpc_state)
+
+    mpc_state = jax.tree_util.tree_map(
+        lambda new, old: jp.where(bad_mpc, old, new),
+        new_mpc_state,
+        state.info["mpc_state"],
     )
     state.info["mpc_state"] = mpc_state
     # Feed the SRBD control (GRF) to the observation, like Tita's mpc_control.
     state.info["mpc_control_last"] = state.info["mpc_control"]
     state.info["mpc_control"] = mpc_state.grf[0]
 
-    def substep_fn(data, _):
-        tau_mpc, _ = self._whole_body_ctrl(data.qpos, data.qvel, mpc_state)
+    def substep_fn(carry, _):
+        data, rng, qpos_measured, qvel_measured = carry
+        tau_mpc, _ = self._whole_body_ctrl(qpos_measured, qvel_measured, mpc_state)
         
-        tau_p = self._config.Kp * ( self._default_pose + action*self._config.action_scale - data.qpos[7:])
-        tau_d = self._config.Kd * ( - data.qvel[6:])
+        tau_p = self._config.Kp * ( self._default_pose + action*self._config.action_scale - qpos_measured[7:])
+        tau_d = self._config.Kd * ( - qvel_measured[6:])
         # config.enable_residual: 1.0 keeps the residual branch, 0.0 removes it
         # and leaves the MPC + whole-body controller torque on its own. The gain
         # is applied to tau_rl itself, so what gets logged (and what the
@@ -444,11 +522,15 @@ class Joystick(lite3_base.Lite3Env):
             "saturated": (jp.abs(tau_final) >= self._tau_max - 1e-6).astype(tau_final.dtype),
             "action": action,
         }
-        return data, llc_log
 
-    data, llc_logs = jax.lax.scan(substep_fn, state.data, None, length=self.n_substeps)
+        rng, qpos_measured, qvel_measured = self._get_noisy_joint_state(data.qpos, data.qvel, rng)
+        return (data, rng, qpos_measured, qvel_measured), llc_log
+
+    (data, rng, qpos_measured, qvel_measured), llc_logs = jax.lax.scan(substep_fn, (state.data, state.info["rng"], qpos_measured, qvel_measured), None, length=self.n_substeps)
     state.info["low_level_controller"] = jax.tree_util.tree_map(lambda x: x[-1], llc_logs)
     state = state.replace(data=data)
+
+    state.info["rng"] = rng
 
     #jax.debug.print("[step]   qpos nan={n}", n=jp.any(jp.isnan(data.qpos)))
     #jax.debug.print("[step]   qvel nan={n}", n=jp.any(jp.isnan(data.qvel)))
@@ -550,6 +632,7 @@ class Joystick(lite3_base.Lite3Env):
         * self._config.noise_config.level
         * self._config.noise_config.scales.joint_pos
     )
+    info["qpos_measured"] = noisy_joint_angles
 
     joint_vel = data.qvel[6:]
     info["rng"], noise_rng = jax.random.split(info["rng"])
@@ -559,6 +642,7 @@ class Joystick(lite3_base.Lite3Env):
         * self._config.noise_config.level
         * self._config.noise_config.scales.joint_vel
     )
+    info["qvel_measured"] = noisy_joint_vel
 
     linvel = self.get_local_linvel(data)
     info["rng"], noise_rng = jax.random.split(info["rng"])
@@ -577,6 +661,17 @@ class Joystick(lite3_base.Lite3Env):
     foot_static_load = config.mass * 9.81 / 4.0       # ~29 N per foot
     mpc_control_grf = mpc_control / foot_static_load   # 12, ~O(1)
 
+    # MPC feet information (from the same SRBD MPC state): reference foot
+    # positions and reference foot velocities.
+    mpc_state_obs = info["mpc_state"]
+    mpc_foot_ref = mpc_state_obs.foot_ref[0]           # 12: MPC foot ref positions
+    mpc_foot_ref_dot = mpc_state_obs.foot_ref_dot[0]   # 12: MPC foot ref velocities
+
+    # MPC gait information: per-foot gait-timer phase (drives the trot pattern)
+    # and the resulting contact schedule (stance/swing per foot).
+    mpc_gait_phase = mpc_state_obs.contact_time[0]     # 4 : gait timer phase
+    mpc_contact = mpc_state_obs.contact[0]             # 4 : contact schedule
+
     state = jp.hstack([
         noisy_linvel,  # 3
         noisy_gyro,  # 3
@@ -585,7 +680,11 @@ class Joystick(lite3_base.Lite3Env):
         noisy_joint_vel,  # 12
         last_act,  # 12
         info["command"],  # 3
-        mpc_control_grf,  # 12  MPC: SRBD ground-reaction forces (control)
+        #mpc_control_grf,  # 12  MPC: SRBD ground-reaction forces (control)
+        #mpc_foot_ref,      # 12  MPC: foot reference positions
+        #mpc_foot_ref_dot,  # 12  MPC: foot reference velocities
+        #mpc_gait_phase,    # 4   MPC: gait timer phase
+        #mpc_contact,       # 4   MPC: contact schedule (gait)
     ])
 
     accelerometer = self.get_accelerometer(data)
@@ -844,4 +943,3 @@ class Joystick(lite3_base.Lite3Env):
     w_k = jax.random.bernoulli(w_rng, 0.5, shape=(3,))
     x_kp1 = x_k - w_k * (x_k - y_k * z_k)
     return x_kp1
-
