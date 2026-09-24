@@ -56,11 +56,6 @@ def default_config() -> config_dict.ConfigDict:
       randomize_reset=1.0,
       Kp=35.0,
       Kd=0.5,
-      # Residual torque budget, in N.m, for an action of magnitude 1. The
-      # validated MPC baseline runs at 3.5 N.m rms with an 18.1 N.m peak against
-      # a +-30 N.m limit, so 6.0 N.m is ~1.7x the baseline rms and still leaves
-      # 18.1 + 6.0 = 24.1 N.m, i.e. no saturation even in the worst scenario.
-      residual_torque_scale=6.0,
       # Gate on the residual branch of the low-level controller. False runs the
       # MPC + whole-body controller alone, by multiplying tau_rl by 0.0 instead
       # of adding it to tau_mpc (see step()). Note that feeding a ZERO ACTION is
@@ -76,8 +71,9 @@ def default_config() -> config_dict.ConfigDict:
           scales=config_dict.create(
               joint_pos=0.03,
               joint_vel=0.1,
-              joint_mpc_pos=0.03,
-              joint_mpc_vel=0.1,
+              base_pos=0.0,
+              base_ori_rp=0.0,
+              base_ori_yaw=0.0,
               gyro=0.2,
               gravity=0.05,
               linvel=0.1,
@@ -227,34 +223,28 @@ class Joystick(lite3_base.Lite3Env):
         rng: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Returns qpos/qvel with noise applied only to actuated joints."""
-    rng, qpos_rng, qvel_rng = jax.random.split(rng, 3)
 
-    joint_qpos_measured = (
-        qpos[7:]
-        + jax.random.uniform(
-            qpos_rng,
-            shape=qpos[7:].shape,
-            minval=-1.0,
-            maxval=1.0,
-        )
+    # --- Actuated joints -----------------------------------------------------
+    joint_angles = qpos[7:]
+    rng, noise_rng = jax.random.split(rng)
+    noisy_joint_angles = (
+        joint_angles
+        + (2 * jax.random.uniform(noise_rng, shape=joint_angles.shape) - 1)
         * self._config.noise_config.level
-        * self._config.noise_config.scales.joint_mpc_pos
+        * self._config.noise_config.scales.joint_pos
     )
 
-    joint_qvel_measured = (
-        qvel[6:]
-        + jax.random.uniform(
-            qvel_rng,
-            shape=qvel[6:].shape,
-            minval=-1.0,
-            maxval=1.0,
-        )
+    joint_vel = qvel[6:]
+    rng, noise_rng = jax.random.split(rng)
+    noisy_joint_vel = (
+        joint_vel
+        + (2 * jax.random.uniform(noise_rng, shape=joint_vel.shape) - 1)
         * self._config.noise_config.level
-        * self._config.noise_config.scales.joint_mpc_vel
+        * self._config.noise_config.scales.joint_vel
     )
 
-    qpos_measured = qpos.at[7:].set(joint_qpos_measured)
-    qvel_measured = qvel.at[6:].set(joint_qvel_measured)
+    qpos_measured = qpos.at[7:].set(noisy_joint_angles)
+    qvel_measured = qvel.at[6:].set(noisy_joint_vel)
 
     return rng, qpos_measured, qvel_measured
 
@@ -265,24 +255,24 @@ class Joystick(lite3_base.Lite3Env):
     # x=+U(-0.5, 0.5), y=+U(-0.5, 0.5), yaw=U(-3.14, 3.14).
     rng, key = jax.random.split(rng)
     dxy = jax.random.uniform(key, (2,), minval=-0.5, maxval=0.5)
-    #qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
+    qpos = qpos.at[0:2].set(qpos[0:2] + dxy)
     rng, key = jax.random.split(rng)
     yaw = jax.random.uniform(key, (1,), minval=-3.14, maxval=3.14)
     quat = math.axis_angle_to_quat(jp.array([0, 0, 1]), yaw)
     new_quat = math.quat_mul(qpos[3:7], quat)
-    #qpos = qpos.at[3:7].set(new_quat)
+    qpos = qpos.at[3:7].set(new_quat)
 
     # d(xyzrpy)=U(-0.5, 0.5)
     rng, key = jax.random.split(rng)
-    #qvel = qvel.at[0:6].set(
-    #    jax.random.uniform(key, (6,), minval=-0.5, maxval=0.5)
-    #)
+    qvel = qvel.at[0:6].set(
+        jax.random.uniform(key, (6,), minval=-0.2, maxval=0.2)
+    )
 
     data = mjx_env.make_data(
         self.mj_model,
         qpos=qpos,
         qvel=qvel,
-        ctrl=qpos[7:],
+        ctrl=jp.zeros(self.mjx_model.nu),
         impl=self.mjx_model.impl.value,
         naconmax=self._config.naconmax,
         njmax=self._config.njmax,
@@ -323,8 +313,8 @@ class Joystick(lite3_base.Lite3Env):
 
     rng, qpos_measured, qvel_measured = (
         self._get_noisy_joint_state(
-            data.qpos,
-            data.qvel,
+            qpos,
+            qvel,
             rng,
         )
     )
@@ -476,9 +466,8 @@ class Joystick(lite3_base.Lite3Env):
       state = self._maybe_apply_perturbation(state)
     # state = self._reset_if_outside_bounds(state)
 
-
-    qpos_measured = state.data.qpos.at[7:].set(state.info["qpos_measured"])
-    qvel_measured = state.data.qvel.at[6:].set(state.info["qvel_measured"])
+    qpos_measured = state.info["qpos_measured"]
+    qvel_measured = state.info["qvel_measured"]
 
     new_mpc_state = self._run_mpc(
         state.data, qpos_measured, qvel_measured, state.data.geom_xpos,
@@ -531,9 +520,8 @@ class Joystick(lite3_base.Lite3Env):
     state = state.replace(data=data)
 
     state.info["rng"] = rng
-
-    #jax.debug.print("[step]   qpos nan={n}", n=jp.any(jp.isnan(data.qpos)))
-    #jax.debug.print("[step]   qvel nan={n}", n=jp.any(jp.isnan(data.qvel)))
+    state.info["qpos_measured"] = qpos_measured
+    state.info["qvel_measured"] = qvel_measured
 
     contact = jp.array([
         data.sensordata[self._mj_model.sensor_adr[sensorid]] > 0
@@ -625,24 +613,9 @@ class Joystick(lite3_base.Lite3Env):
     )
 
     joint_angles = data.qpos[7:]
-    info["rng"], noise_rng = jax.random.split(info["rng"])
-    noisy_joint_angles = (
-        joint_angles
-        + (2 * jax.random.uniform(noise_rng, shape=joint_angles.shape) - 1)
-        * self._config.noise_config.level
-        * self._config.noise_config.scales.joint_pos
-    )
-    info["qpos_measured"] = noisy_joint_angles
-
     joint_vel = data.qvel[6:]
-    info["rng"], noise_rng = jax.random.split(info["rng"])
-    noisy_joint_vel = (
-        joint_vel
-        + (2 * jax.random.uniform(noise_rng, shape=joint_vel.shape) - 1)
-        * self._config.noise_config.level
-        * self._config.noise_config.scales.joint_vel
-    )
-    info["qvel_measured"] = noisy_joint_vel
+    noisy_joint_angles = info["qpos_measured"][7:]
+    noisy_joint_vel = info["qvel_measured"][6:]
 
     linvel = self.get_local_linvel(data)
     info["rng"], noise_rng = jax.random.split(info["rng"])
