@@ -264,9 +264,9 @@ class Joystick(lite3_base.Lite3Env):
 
     # d(xyzrpy)=U(-0.5, 0.5)
     rng, key = jax.random.split(rng)
-    qvel = qvel.at[0:6].set(
-        jax.random.uniform(key, (6,), minval=-0.2, maxval=0.2)
-    )
+    #qvel = qvel.at[0:6].set(
+    #    jax.random.uniform(key, (6,), minval=-0.2, maxval=0.2)
+    #)
 
     data = mjx_env.make_data(
         self.mj_model,
@@ -319,7 +319,20 @@ class Joystick(lite3_base.Lite3Env):
         )
     )
 
-    mpc_state  = self.mpc.init_state()
+    # Seed the MPC warm-start with the ACTUAL reset state (base pose incl. yaw +
+    # velocity), x0 = [p(3), quat(4), v(3), omega(3)] (same layout as _run_mpc); the
+    # wrapper builds a coherent standing warm-start at that pose. Gated behind
+    # config.mpc_seed_warmstart: removes the yaw-dependent startup transient (roll
+    # ~0.38 -> ~0.10 rad) when the startup command is neutral (compare.py zeroes the
+    # command at eval reset; here in the raw env the reset command is random, so its
+    # own transient is separate from the warm-start).
+    if getattr(config, "mpc_seed_warmstart", False):
+      x0_init = jp.concatenate(
+          [qpos_measured[:3], qpos_measured[3:7], qvel_measured[:3], qvel_measured[3:6]]
+      )[None]
+      mpc_state = self.mpc.init_state(x0=x0_init)
+    else:
+      mpc_state = self.mpc.init_state()
     mpc_state = self._run_mpc(
         data, qpos_measured, qvel_measured, data.geom_xpos, cmd, mpc_state
     )

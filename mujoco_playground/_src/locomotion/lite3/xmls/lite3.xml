@@ -4,6 +4,11 @@
     <flag eulerdamp="disable"/>
   </option>
 
+  <!-- Render free-camera distance from the tracked COM, read by the video recorder. -->
+  <custom>
+    <numeric name="render_cam_distance" data="2.0"/>
+  </custom>
+
   <default>
     <light castshadow="false" diffuse="1 1 1"/>
     <camera fovy="60"/>
