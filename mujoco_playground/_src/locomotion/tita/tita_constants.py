@@ -38,6 +38,20 @@ FEET_ONLY_PERLIN_TERRAIN_XML = (
     ROOT_PATH / "xmls" / "scene_perlin.xml"
 )
 
+# Sparse random boxes on a flat floor: the "rough" entry of config.terrain.
+SPARSE_ROUGH_TERRAIN_XML = ROOT_PATH / "xmls" / "scene_rough_sparse.xml"
+
+# Union of flat and sparse rough terrain only (see the XML header).
+ALL_TERRAIN_XML = ROOT_PATH / "xmls" / "scene_all.xml"
+
+# Single-terrain scene of each config.terrain entry; several entries load
+# ALL_TERRAIN_XML.
+TERRAIN_XMLS = {
+    "flat": FEET_ONLY_FLAT_TERRAIN_XML,
+    "rough": SPARSE_ROUGH_TERRAIN_XML,
+    "perlin": FEET_ONLY_PERLIN_TERRAIN_XML,
+}
+
 
 def task_to_xml(task_name: str) -> epath.Path:
   return {
@@ -87,6 +101,10 @@ FEET_TOUCH_SENSORS = ("FL_floor_found", "FR_floor_found")
 FEET_FLOOR_FOUND_SENSORS = ("FL_floor_found", "FR_floor_found")
 
 FLOOR_GEOM = "floor"
+# Ground geoms: scene_all.xml adds the perlin floor plane, the single scenes
+# only have "floor". Each wheel has a "<FL|FR>_<ground>_found" contact sensor
+# on every ground present in the model.
+FLOOR_GEOMS = ("floor", "perlin_floor")
  
 # Geoms che, a contatto con il pavimento, terminano l'episodio
 # (equivalente di termination_contact_indices in Isaac: "base").
