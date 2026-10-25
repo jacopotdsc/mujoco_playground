@@ -1,0 +1,63 @@
+<mujoco model="tita mixed scene (no perlin)">
+  <!-- Mixed training terrain (HRC Tita, tita_hybrid_plan): one floor plane at
+       z = 0 and four regions, spawn chosen at each reset (joystick.py,
+       terrain_config.scene = "mixed"):
+         flat    centre (-15, 0)
+         slopes  lanes 0 / 5 / 10 deg at y = 0 / +3 / -3 (as scene_slopes.xml)
+         rough   centre (25, 0): 12 of the 50 sparse boxes (closest to the centre) of residual_tita_v2
+                 scene_rough_sparse.xml shifted by +25 m in x
+         perlin  removed (MJX hfield ~doubles the step cost; Perlin is used
+                 for evaluation only)
+       Terrain geoms are named slope_* / terrain_* (termination checks them). -->
+  <include file="tita.xml"/>
+
+  <statistic center="15 0 0.1" extent="30"/>
+
+  <visual>
+    <headlight diffuse=".8 .8 .8" ambient=".2 .2 .2" specular="1 1 1"/>
+    <rgba force="1 0 0 1"/>
+    <global azimuth="120" elevation="-20"/>
+    <map force="0.01"/>
+    <scale forcewidth="0.3" contactwidth="0.5" contactheight="0.2"/>
+    <quality shadowsize="8192"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="1 1 1" rgb2="1 1 1" width="800" height="800"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="1 1 1" rgb2="1 1 1" markrgb="0 0 0"
+      width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0"/>
+  </asset>
+
+  <worldbody>
+    <geom name="floor" size="0 0 0.01" type="plane" material="groundplane"
+    contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+
+    <geom name="slope_5_ramp" type="box" size="3 0.6 0.1" pos="3.597301 3 0.1618476"
+      quat="0.9990482 0 -0.0436194 0" contype="1" conaffinity="0" priority="1"
+      friction="0.6" condim="3" rgba="0.6 0.7 0.8 1"/>
+    <geom name="slope_5_plateau" type="box" size="2 0.6 0.311467" pos="8.57717 3 0.211467"
+      contype="1" conaffinity="0" priority="1" friction="0.6" condim="3" rgba="0.6 0.7 0.8 1"/>
+    <geom name="slope_10_ramp" type="box" size="3 0.6 0.1" pos="3.5717882 -3 0.4224638"
+      quat="0.9961947 0 -0.0871557 0" contype="1" conaffinity="0" priority="1"
+      friction="0.6" condim="3" rgba="0.8 0.7 0.6 1"/>
+    <geom name="slope_10_plateau" type="box" size="2 0.6 0.5709446" pos="8.5088468 -3 0.4709446"
+      contype="1" conaffinity="0" priority="1" friction="0.6" condim="3" rgba="0.8 0.7 0.6 1"/>
+
+    <geom name="terrain_rough_1" type="box" pos="24.7870 -3.1834 0.0089" size="0.1311 0.1603 0.0089" quat="0.85353 0 0 -0.52104" rgba="0.5 0.4 0.3 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+    <geom name="terrain_rough_2" type="box" pos="23.9685 1.0124 0.0125" size="0.2564 0.0973 0.0125" quat="0.01876 0 0 0.99982" rgba="0.5 0.4 0.3 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+    <geom name="terrain_rough_3" type="box" pos="23.9675 -0.3981 0.0090" size="0.2832 0.2236 0.0090" quat="0.63454 0 0 0.77289" rgba="0.5 0.4 0.3 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+    <geom name="terrain_rough_11" type="box" pos="24.7271 -0.8139 0.0104" size="0.0862 0.1746 0.0104" quat="0.84816 0 0 -0.52975" rgba="0.5 0.4 0.3 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+    <geom name="terrain_rough_13" type="box" pos="26.1833 0.6537 0.0129" size="0.0835 0.2948 0.0129" quat="0.65023 0 0 -0.75974" rgba="0.5 0.4 0.3 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+    <geom name="terrain_rough_15" type="box" pos="26.2321 2.3093 0.0105" size="0.1928 0.1479 0.0105" quat="0.96656 0 0 -0.25645" rgba="0.5 0.4 0.3 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+    <geom name="terrain_rough_18" type="box" pos="27.2186 -2.5131 0.0143" size="0.2651 0.2739 0.0143" quat="0.95757 0 0 -0.28819" rgba="0.5 0.4 0.3 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+    <geom name="terrain_rough_20" type="box" pos="25.8822 0.9290 0.0144" size="0.1557 0.1557 0.0144" quat="0.71948 0 0 0.69451" rgba="0.5 0.4 0.3 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+    <geom name="terrain_rough_21" type="box" pos="22.9871 0.9915 0.0085" size="0.1747 0.2989 0.0085" quat="0.44873 0 0 0.89367" rgba="0.5 0.4 0.3 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+    <geom name="terrain_rough_32" type="box" pos="27.2881 0.4262 0.0113" size="0.2581 0.1111 0.0113" quat="0.26739 0 0 0.96359" rgba="0.5 0.4 0.3 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+    <geom name="terrain_rough_46" type="box" pos="23.2506 -2.3689 0.0124" size="0.0895 0.0814 0.0124" quat="0.37597 0 0 -0.92663" rgba="0.5 0.4 0.3 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+    <geom name="terrain_rough_48" type="box" pos="23.5364 1.2118 0.0080" size="0.1714 0.2952 0.0080" quat="0.83744 0 0 0.54653" rgba="0.5 0.4 0.3 1" contype="1" conaffinity="0" priority="1" friction="0.6" condim="3"/>
+
+  </worldbody>
+
+  <include file="sensor_feet.xml"/>
+</mujoco>
